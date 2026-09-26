@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "Draft",
+  "namespace": "maxbenefits",
+  "doc": "A card the agent drafted for admins to review.",
+  "fields": [
+    {"name": "id", "type": "string", "doc": "Derived from the content: a draft delivered twice is one draft."},
+    {"name": "card", "type": "Card"},
+    {"name": "updates", "type": "string", "default": "", "doc": "ID of the card the draft rewrites; empty for a new card."},
+    {"name": "query", "type": "string", "doc": "The search query that found it."},
+    {"name": "sources", "type": {"type": "array", "items": "string"}, "default": []},
+    {"name": "notes", "type": {"type": "array", "items": "string"}, "default": [], "doc": "Problems the agent could not fix."},
+    {"name": "found_at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "run_id", "type": "string", "default": "", "doc": "The agent run that made it."}
+  ]
+}

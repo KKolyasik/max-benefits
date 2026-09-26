@@ -1,0 +1,37 @@
+{
+  "type": "record",
+  "name": "Survey",
+  "namespace": "maxbenefits",
+  "doc": "The questionnaire: bot sections and the questions asked in them.",
+  "fields": [
+    {"name": "categories", "type": {"type": "array", "items": {
+      "type": "record",
+      "name": "Category",
+      "fields": [
+        {"name": "id", "type": "string"},
+        {"name": "title", "type": "string"},
+        {"name": "intro", "type": "string", "default": ""},
+        {"name": "questions", "type": {"type": "array", "items": "string"}, "doc": "IDs of the questions asked in the section, in order."}
+      ]
+    }}},
+    {"name": "questions", "type": {"type": "array", "items": {
+      "type": "record",
+      "name": "Question",
+      "fields": [
+        {"name": "id", "type": "string"},
+        {"name": "label", "type": "string", "doc": "Short name for the profile summary."},
+        {"name": "text", "type": "string"},
+        {"name": "multi", "type": "boolean", "default": false},
+        {"name": "options", "type": {"type": "array", "items": {
+          "type": "record",
+          "name": "Option",
+          "fields": [
+            {"name": "id", "type": "string"},
+            {"name": "title", "type": "string"},
+            {"name": "exclusive", "type": "boolean", "default": false}
+          ]
+        }}}
+      ]
+    }}}
+  ]
+}

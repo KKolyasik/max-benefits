@@ -8,7 +8,8 @@
 #
 #   lint   — golangci-lint (.golangci.yml), hadolint для Dockerfile, actionlint
 #            для этого файла;
-#   test   — go test с -race и покрытием, тесты базы — на Postgres из services;
+#   test   — go test с -race и покрытием; тесты базы — на Postgres из services,
+#            тест контракта — на Kafka и Schema Registry из docker-compose.yml;
 #   build  — образ linux/amd64 с тегом <sha коммита>; в Docker Hub уходит всё,
 #            кроме пул-реквестов, когда Docker Hub настроен;
 #   deploy — выкатка на сервер, как manual-джоба в GitLab: окружение production
@@ -68,14 +69,23 @@ jobs:
     env:
       # Each database test creates a database of its own there.
       TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
+      # The contract test uses topics and a subject of its own.
+      KAFKA_BROKERS: localhost:9092
+      SCHEMA_REGISTRY_URL: http://localhost:8085
     steps:
       - uses: actions/checkout@v7
+      - name: start kafka and schema registry
+        # The same setup as locally. Kafka is up once this returns; the registry
+        # finishes starting while Go installs.
+        run: docker compose up -d kafka schema-registry
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: pdftotext
         # The agent reads PDF with it; without it the PDF test is skipped.
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends poppler-utils
+      - name: wait for kafka and schema registry
+        run: docker compose up -d --wait kafka schema-registry
       - name: go test
         run: |
           go test -race -count=1 -coverprofile=coverage.out ./...

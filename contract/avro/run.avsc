@@ -1,0 +1,23 @@
+{
+  "type": "record",
+  "name": "RunReport",
+  "namespace": "maxbenefits",
+  "doc": "How an agent run went.",
+  "fields": [
+    {"name": "run_id", "type": "string"},
+    {"name": "trigger", "type": {"type": "enum", "name": "RunTrigger", "symbols": ["UNKNOWN", "SCHEDULE", "COMMAND"], "default": "UNKNOWN"}},
+    {"name": "command_id", "type": "string", "default": "", "doc": "The command that started the run, if any."},
+    {"name": "status", "type": {"type": "enum", "name": "RunStatus", "symbols": ["UNKNOWN", "DONE", "FAILED", "BUSY"], "default": "UNKNOWN"},
+     "doc": "BUSY: the command came during another run and was skipped."},
+    {"name": "started_at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "finished_at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "queries", "type": "int", "default": 0},
+    {"name": "unchanged", "type": "int", "default": 0},
+    {"name": "failed", "type": "int", "default": 0},
+    {"name": "deferred", "type": "int", "default": 0},
+    {"name": "drafts", "type": "int", "default": 0},
+    {"name": "input_tokens", "type": "long", "default": 0},
+    {"name": "output_tokens", "type": "long", "default": 0},
+    {"name": "error", "type": "string", "default": "", "doc": "Why the run failed."}
+  ]
+}
