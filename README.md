@@ -332,24 +332,19 @@ test ─┘
 Один раз, в **Settings** репозитория на GitHub:
 
 1. **Environments → New environment** `production` → **Required reviewers**: добавьте тех, кто может выкатывать. Без ревьюера деплой пойдёт сразу, без кнопки. В **Deployment branches and tags** можно разрешить только `main` и теги `v*`.
-2. **Secrets and variables → Actions → Variables**:
+2. **Secrets and variables → Actions → Secrets → New repository secret**. Все настройки — секреты: логи Actions публичного репозитория видны всем, а секреты в них маскируются. Кладите их в секреты репозитория, не окружения: часть из них читает джоба `build`. Посмотреть сохранённый секрет нельзя, только перезаписать, так что держите значения у себя.
 
-   | Переменная | Пример | Что это |
+   | Секрет | Пример | Что это |
    |---|---|---|
    | `DOCKERHUB_USERNAME` | `kkolyasik` | Логин Docker Hub |
+   | `DOCKERHUB_TOKEN` | — | Access token Docker Hub с правами Read & Write (hub.docker.com → Account settings → Personal access tokens) |
    | `IMAGE` | `kkolyasik/max-benefits-bot` | Репозиторий образа в Docker Hub |
-   | `DEPLOY_HOST` | IP сервера | Куда выкатывать. Пока переменная не задана, джобы `deploy` в пайплайне нет |
+   | `DEPLOY_HOST` | IP сервера | Куда выкатывать. Пока секрет не задан, джобы `deploy` в пайплайне нет |
    | `DEPLOY_USER` | `maxbot` | Пользователь на сервере |
+   | `DEPLOY_SSH_KEY` | — | Приватный SSH-ключ пользователя `DEPLOY_USER`, целиком, со строками `BEGIN`/`END` |
    | `DEPLOY_HOST_FINGERPRINT` | `SHA256:…` | Отпечаток ECDSA-ключа сервера, защищает от подмены сервера: `ssh-keyscan -t ecdsa <сервер> \| ssh-keygen -lf -` |
-   | `DEPLOY_PATH` | `/opt/max-benefits` | Папка приложения на сервере; это же значение по умолчанию |
    | `WEBHOOK_URL` | `https://<домен>/webhook` | Адрес, на который MAX присылает события |
-
-3. **Secrets and variables → Actions → Secrets**:
-
-   | Секрет | Что это |
-   |---|---|
-   | `DOCKERHUB_TOKEN` | Access token Docker Hub с правами Read & Write (hub.docker.com → Account settings → Personal access tokens) |
-   | `DEPLOY_SSH_KEY` | Приватный SSH-ключ пользователя `DEPLOY_USER`, целиком, со строками `BEGIN`/`END`. Его лучше положить в секреты окружения `production`: тогда он доступен только после подтверждения деплоя |
+   | `DEPLOY_PATH` | `/opt/max-benefits` | Необязательный: папка приложения на сервере, по умолчанию `/opt/max-benefits` |
 
 ### Токен бота
 

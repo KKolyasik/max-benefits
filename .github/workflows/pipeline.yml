@@ -14,10 +14,12 @@
 #   deploy — выкатка на сервер, как manual-джоба в GitLab: окружение production
 #            требует подтверждения, и джоба ждёт кнопку.
 #
-# Настройки — в README, раздел «CI/CD и деплой»: переменные DOCKERHUB_USERNAME,
-# IMAGE, DEPLOY_HOST, DEPLOY_USER, DEPLOY_HOST_FINGERPRINT, DEPLOY_PATH,
-# WEBHOOK_URL и секреты DOCKERHUB_TOKEN, DEPLOY_SSH_KEY. Токен бота, пароль
-# Postgres и секрет вебхука хранятся только на сервере, в .env.
+# Настройки — секреты репозитория, см. README, раздел «CI/CD и деплой»:
+# DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, IMAGE, DEPLOY_HOST, DEPLOY_USER,
+# DEPLOY_HOST_FINGERPRINT, DEPLOY_SSH_KEY, WEBHOOK_URL и, если нужно,
+# DEPLOY_PATH. Логи публичного репозитория видны всем, а секреты в них
+# маскируются. Токен бота, пароль Postgres и секрет вебхука хранятся только на
+# сервере, в .env.
 
 name: pipeline
 
@@ -87,29 +89,33 @@ jobs:
     needs: [lint, test]
     runs-on: ubuntu-24.04
     outputs:
-      image: ${{ steps.image.outputs.name }}
+      # A job's `if` can't read secrets, so the build tells the deploy
+      # whether it is set up. An output with a secret in it would be dropped,
+      # hence a plain true or false.
+      deploy: ${{ steps.setup.outputs.deploy }}
     env:
       # Pull requests are only built; so is everything until Docker Hub is
       # set up, e.g. in a fork.
-      PUSH: ${{ github.event_name != 'pull_request' && vars.DOCKERHUB_USERNAME != '' }}
+      PUSH: ${{ github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME != '' }}
+      IMAGE: ${{ secrets.IMAGE || 'max-benefits-bot' }}
     steps:
       - uses: actions/checkout@v7
-      - name: image name
-        id: image
-        # The tag is the commit, so a deploy takes exactly what was tested.
-        run: echo "name=${{ vars.IMAGE || 'max-benefits-bot' }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: deploy set up
+        id: setup
+        run: echo "deploy=${{ secrets.DEPLOY_HOST != '' }}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         if: env.PUSH == 'true'
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
           push: ${{ env.PUSH == 'true' }}
-          tags: ${{ steps.image.outputs.name }}
+          # The tag is the commit, so a deploy takes exactly what was tested.
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -117,39 +123,39 @@ jobs:
     needs: build
     # Pull requests are only checked. Without DEPLOY_HOST the repository is
     # not set up for deploys yet, e.g. in a fork.
-    if: github.event_name != 'pull_request' && vars.DEPLOY_HOST != ''
+    if: github.event_name != 'pull_request' && needs.build.outputs.deploy == 'true'
     runs-on: ubuntu-24.04
     environment: production
     concurrency:
       group: deploy
       cancel-in-progress: false
     env:
-      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/max-benefits' }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/max-benefits' }}
     steps:
       - uses: actions/checkout@v7
       - name: upload compose file
         uses: appleboy/scp-action@v1
         with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ vars.DEPLOY_USER }}
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           # The server's host key: guards against a spoofed server. ECDSA,
           # since the Go SSH client of appleboy/* picks this key type.
-          fingerprint: ${{ vars.DEPLOY_HOST_FINGERPRINT }}
+          fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
           source: deploy/docker-compose.prod.yml
           target: ${{ env.DEPLOY_PATH }}
           strip_components: 1
       - name: release
         uses: appleboy/ssh-action@v1
         env:
-          RELEASE_IMAGE: ${{ needs.build.outputs.image }}
+          RELEASE_IMAGE: ${{ secrets.IMAGE }}:${{ github.sha }}
           RELEASE_REF: ${{ github.ref_name }}
-          WEBHOOK_URL: ${{ vars.WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ vars.DEPLOY_USER }}
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          fingerprint: ${{ vars.DEPLOY_HOST_FINGERPRINT }}
+          fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
           envs: RELEASE_IMAGE,RELEASE_REF,WEBHOOK_URL,DEPLOY_PATH
           script: |
             set -eu
@@ -159,7 +165,7 @@ jobs:
             fi
             case "$WEBHOOK_URL" in
               https://*) ;;
-              *) echo "Set the WEBHOOK_URL variable of the repository to the https address of the webhook"; exit 1 ;;
+              *) echo "Set the WEBHOOK_URL secret of the repository to the https address of the webhook"; exit 1 ;;
             esac
 
             cd "$DEPLOY_PATH"
