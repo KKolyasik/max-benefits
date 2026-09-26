@@ -73,7 +73,7 @@ jobs:
           go-version-file: go.mod
       - name: pdftotext
         # The agent reads PDF with it; without it the PDF test is skipped.
-        run: sudo apt-get install -y --no-install-recommends poppler-utils
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends poppler-utils
       - name: go test
         run: |
           go test -race -count=1 -coverprofile=coverage.out ./...
