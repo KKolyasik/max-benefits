@@ -1,0 +1,69 @@
+# Production stack on the server. CI uploads this file to DEPLOY_PATH
+# (/opt/max-benefits) and runs it with the .env next to it: BOT_IMAGE and
+# WEBHOOK_URL come from the deploy, the rest is set on the server.
+# The questionnaire is baked into the image, so a rollback restores it with
+# the code. The cards live in Postgres: the image only fills an empty
+# database, and cards approved by admins survive deploys and rollbacks.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  bot:
+    image: ${BOT_IMAGE:?set BOT_IMAGE to the image to run}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_ADDR: redis:6379
+      # The deploy generates POSTGRES_PASSWORD into .env once.
+      DATABASE_URL: postgres://benefits:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/benefits?sslmode=disable
+      # MAX sends updates to nginx on the host, which proxies them to the
+      # published port. WEBHOOK_SECRET is in .env as well.
+      WEBHOOK_URL: ${WEBHOOK_URL:?set WEBHOOK_URL in .env}
+    # Only nginx on the same host can reach the bot. BOT_PORT is the port
+    # nginx proxies to.
+    ports:
+      - "127.0.0.1:${BOT_PORT:-8081}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 30s
+    logging: *logging
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: benefits
+      POSTGRES_DB: benefits
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    # Not published: only the bot reaches it, over the compose network.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benefits -d benefits"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+volumes:
+  redis-data:
+  postgres-data:

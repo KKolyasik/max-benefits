@@ -1,0 +1,4 @@
+ignored:
+  # Alpine drops old package versions from its repositories, so pinned
+  # versions in `apk add` would break the build over time.
+  - DL3018

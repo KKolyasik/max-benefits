@@ -1,0 +1,352 @@
+package bot
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/KKolyasik/max-benefits/internal/knowledge"
+	"github.com/KKolyasik/max-benefits/internal/moderation"
+	"github.com/KKolyasik/max-benefits/internal/session"
+	"github.com/KKolyasik/max-benefits/internal/survey"
+)
+
+const adminID = 7
+
+// base is an in-memory knowledge base with drafts, standing in for Postgres.
+// Students read the same cards the admins publish.
+type base struct {
+	mu     sync.Mutex
+	survey *survey.Survey
+	cards  []knowledge.Card
+	drafts []moderation.Draft
+}
+
+func (b *base) Find(_ context.Context, req knowledge.Request) ([]knowledge.Entry, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return knowledge.Pick(b.cards, req), nil
+}
+
+func (b *base) PendingDrafts(context.Context) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, d := range b.drafts {
+		if d.Status == moderation.Pending {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (b *base) NextDraft(_ context.Context, after int64) (moderation.Draft, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, d := range b.drafts {
+		if d.ID > after && d.Status == moderation.Pending {
+			return d, true, nil
+		}
+	}
+	return moderation.Draft{}, false, nil
+}
+
+func (b *base) Card(_ context.Context, id string) (knowledge.Card, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	i := slices.IndexFunc(b.cards, func(c knowledge.Card) bool { return c.ID == id })
+	if i < 0 {
+		return knowledge.Card{}, false, nil
+	}
+	return b.cards[i], true, nil
+}
+
+func (b *base) ApproveDraft(_ context.Context, id, _ int64) (knowledge.Card, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	d, err := b.pending(id)
+	if err != nil {
+		return knowledge.Card{}, false, err
+	}
+	i := slices.IndexFunc(b.cards, func(c knowledge.Card) bool { return c.ID == d.Card.ID })
+	var current *knowledge.Card
+	if i >= 0 {
+		current = &b.cards[i]
+	}
+	if problems := moderation.Problems(*d, b.survey, current); len(problems) > 0 {
+		return knowledge.Card{}, false, &moderation.InvalidError{Problems: problems}
+	}
+	if i >= 0 {
+		b.cards[i] = d.Card
+	} else {
+		b.cards = append(b.cards, d.Card)
+	}
+	d.Status = moderation.Approved
+	return d.Card, i >= 0, nil
+}
+
+func (b *base) RejectDraft(_ context.Context, id, _ int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	d, err := b.pending(id)
+	if err != nil {
+		return err
+	}
+	d.Status = moderation.Rejected
+	return nil
+}
+
+func (b *base) pending(id int64) (*moderation.Draft, error) {
+	i := slices.IndexFunc(b.drafts, func(d moderation.Draft) bool { return d.ID == id })
+	if i < 0 {
+		return nil, moderation.ErrNotFound
+	}
+	if b.drafts[i].Status != moderation.Pending {
+		return nil, moderation.ErrDecided
+	}
+	return &b.drafts[i], nil
+}
+
+func (b *base) addDraft(card knowledge.Card, updates string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.drafts = append(b.drafts, moderation.Draft{
+		ID: int64(len(b.drafts) + 1), Card: card, Updates: updates, Query: "стипендия",
+		Sources: []string{"https://a.example/page"}, FoundAt: time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC),
+		Status: moderation.Pending,
+	})
+}
+
+// chats routes messages to the chat of each user.
+type chats map[int64]*chat
+
+func (c chats) Send(ctx context.Context, userID int64, msg Message) error {
+	return c[userID].Send(ctx, userID, msg)
+}
+
+func (c chats) AnswerCallback(ctx context.Context, userID int64, id string, a CallbackAnswer) error {
+	return c[userID].AnswerCallback(ctx, userID, id, a)
+}
+
+// newAdminSetup returns an admin and a student of one bot over one base.
+func newAdminSetup(t *testing.T) (admin, student *user, kb *base) {
+	t.Helper()
+	sv, err := survey.Parse([]byte(testSurvey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cards, err := knowledge.ParseCards([]byte(testKnowledge))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kb = &base{survey: sv, cards: cards}
+	out := chats{adminID: {}, 42: {}}
+	store := session.NewMemory()
+	b := New(sv, kb, store, out, slog.New(slog.DiscardHandler)).WithModeration(kb, []int64{adminID})
+	admin = &user{t: t, id: adminID, bot: b, chat: out[adminID], store: store}
+	student = &user{t: t, id: 42, bot: b, chat: out[42], store: store}
+	return admin, student, kb
+}
+
+var grant = knowledge.Card{ID: "grant", Categories: []string{"money"}, Priority: 50, Title: "Грант", Summary: "Деньги всем."}
+
+func (u *user) hasButton(text string) bool {
+	u.chat.mu.Lock()
+	defer u.chat.mu.Unlock()
+	for i := len(u.chat.messages) - 1; i >= 0; i-- {
+		if kb := u.chat.messages[i].Keyboard; len(kb) > 0 {
+			for _, row := range kb {
+				for _, b := range row {
+					if strings.Contains(b.Text, text) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+
+func TestApprovedDraftIsShownToStudentsAtOnce(t *testing.T) {
+	admin, student, kb := newAdminSetup(t)
+	kb.addDraft(grant, "")
+
+	student.start()
+	student.press("Деньги")
+	student.press("Вуз А")
+	student.press("Ничего")
+	student.press("Готово")
+	if strings.Contains(student.allText(), "Грант") {
+		t.Fatal("the draft must not be shown before approval")
+	}
+
+	admin.start()
+	admin.press("Черновики")
+	preview := admin.chat.messages[len(admin.chat.messages)-2]
+	if !preview.Markdown || !strings.Contains(preview.Text, "**Грант**\nДеньги всем.") {
+		t.Errorf("the card must be previewed as students see it:\n%s", preview.Text)
+	}
+	controls := admin.chat.last().Text
+	for _, want := range []string{"Черновик №1: новая карточка", "На проверке всего: 1", "Разделы: Деньги",
+		"Кому покажется: всем в разделе", "Запрос агента: «стипендия»", "1. https://a.example/page"} {
+		if !strings.Contains(controls, want) {
+			t.Errorf("controls have no %q:\n%s", want, controls)
+		}
+	}
+	admin.press("Одобрить")
+	if got := admin.chat.lastAnswer().Edit.Text; !strings.HasSuffix(got, "👉 "+textApproved) {
+		t.Errorf("the decision must stay in the chat: %q", got)
+	}
+	if got := admin.chat.last().Text; got != textNoDrafts {
+		t.Errorf("after the last draft: %q", got)
+	}
+
+	student.press("Другие разделы")
+	student.press("Деньги")
+	student.press("Показать подборку")
+	if !strings.Contains(student.allText(), "**Грант**") {
+		t.Error("an approved card must be in the selection at once")
+	}
+}
+
+func TestStudentsHaveNoAdmin(t *testing.T) {
+	_, student, kb := newAdminSetup(t)
+	kb.addDraft(grant, "")
+
+	student.start()
+	if student.hasButton("Черновики") {
+		t.Error("only admins see the drafts button")
+	}
+	student.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: payload(actApprove, "1"), SourceText: "подделка"})
+	if got := student.chat.lastAnswer().Notification; got != textStale {
+		t.Errorf("a forged admin press must be ignored, got %q", got)
+	}
+	student.say("/admin")
+	if got := student.chat.last().Text; !strings.Contains(got, textUseButtons) {
+		t.Errorf("/admin for a student: %q", got)
+	}
+	if n, _ := kb.PendingDrafts(context.Background()); n != 1 {
+		t.Error("the draft must stay pending")
+	}
+}
+
+func TestUpdateDraftShowsWhatChanges(t *testing.T) {
+	admin, _, kb := newAdminSetup(t)
+	current, _, _ := kb.Card(context.Background(), "for_all")
+	updated := current
+	updated.Title = "Для всех, 2027"
+	kb.addDraft(updated, "for_all")
+
+	admin.say("/admin")
+	controls := admin.chat.last().Text
+	if !strings.Contains(controls, "обновление карточки «Для всех»") || !strings.Contains(controls, "Что изменится: заголовок") {
+		t.Errorf("controls:\n%s", controls)
+	}
+	admin.press("Одобрить")
+	if got := admin.chat.lastAnswer().Edit.Text; !strings.HasSuffix(got, textUpdated) {
+		t.Errorf("answer %q", got)
+	}
+	if c, _, _ := kb.Card(context.Background(), "for_all"); c.Title != "Для всех, 2027" {
+		t.Errorf("card %+v", c)
+	}
+}
+
+func TestInvalidDraftCannotBeApproved(t *testing.T) {
+	admin, _, kb := newAdminSetup(t)
+	bad := grant
+	bad.Match = knowledge.Condition{"hobby": {"art"}}
+	kb.addDraft(bad, "")
+
+	admin.say("/admin")
+	if !strings.Contains(admin.chat.last().Text, "⛔ Одобрить нельзя") || admin.hasButton("Одобрить") {
+		t.Errorf("an invalid draft must have no approve button:\n%s", admin.chat.last().Text)
+	}
+	admin.press("Отклонить")
+	if got := admin.chat.last().Text; got != textNoDrafts {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestBaseChangedBeforeApproval(t *testing.T) {
+	admin, _, kb := newAdminSetup(t)
+	kb.addDraft(grant, "")
+	admin.say("/admin")
+
+	// The same card was published meanwhile, e.g. from another draft.
+	kb.mu.Lock()
+	kb.cards = append(kb.cards, grant)
+	kb.mu.Unlock()
+
+	admin.press("Одобрить")
+	if got := admin.chat.lastAnswer().Edit.Text; !strings.HasSuffix(got, textCantApprove) {
+		t.Errorf("answer %q", got)
+	}
+	if !strings.Contains(admin.chat.last().Text, `card "grant" is already in the base`) {
+		t.Errorf("the draft must be shown again with the reason:\n%s", admin.chat.last().Text)
+	}
+}
+
+func TestSkipRejectAndGoRound(t *testing.T) {
+	admin, _, kb := newAdminSetup(t)
+	for i := range 2 {
+		c := grant
+		c.ID, c.Title = fmt.Sprintf("grant_%d", i), fmt.Sprintf("Грант %d", i)
+		kb.addDraft(c, "")
+	}
+
+	admin.say("/admin")
+	admin.press("Пропустить")
+	if !strings.Contains(admin.chat.last().Text, "Черновик №2") {
+		t.Fatalf("skip must show the next draft:\n%s", admin.chat.last().Text)
+	}
+	admin.press("Отклонить")
+	if got := admin.chat.last().Text; got != fmt.Sprintf(textLastDraft, 1) {
+		t.Fatalf("got %q", got)
+	}
+	admin.press("Сначала")
+	if !strings.Contains(admin.chat.last().Text, "Черновик №1") {
+		t.Errorf("the skipped draft must come back:\n%s", admin.chat.last().Text)
+	}
+}
+
+func TestDraftDecidedByAnotherAdmin(t *testing.T) {
+	admin, _, kb := newAdminSetup(t)
+	kb.addDraft(grant, "")
+	admin.say("/admin")
+	if err := kb.RejectDraft(context.Background(), 1, 99); err != nil {
+		t.Fatal(err)
+	}
+
+	admin.press("Одобрить")
+	if got := admin.chat.lastAnswer().Edit.Text; !strings.HasSuffix(got, textDecided) {
+		t.Errorf("answer %q", got)
+	}
+	if c, found, _ := kb.Card(context.Background(), "grant"); found {
+		t.Errorf("a rejected draft must not be published: %+v", c)
+	}
+}
+
+func TestNotifyDrafts(t *testing.T) {
+	admin, student, kb := newAdminSetup(t)
+	kb.addDraft(grant, "")
+
+	if err := admin.bot.NotifyDrafts(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := admin.chat.last(); !strings.Contains(got.Text, "черновики: 1") || !admin.hasButton("Разобрать") {
+		t.Errorf("notification %+v", got)
+	}
+	if len(student.chat.messages) != 0 {
+		t.Error("students must not be notified")
+	}
+	admin.press("Разобрать")
+	if !strings.Contains(admin.chat.last().Text, "Черновик №1") {
+		t.Errorf("the button must open the draft:\n%s", admin.chat.last().Text)
+	}
+}

@@ -1,0 +1,127 @@
+# Рубрикатор и анкета бота.
+#
+# categories — разделы главного меню. questions — ID вопросов, которые бот
+# задаёт в разделе (по порядку). Ответы общие для всех разделов: если вопрос
+# уже задан в одном разделе, в другом бот его пропустит.
+#
+# questions — вопросы с кнопками-вариантами. multi: true — можно выбрать
+# несколько вариантов; exclusive: true — вариант снимает все остальные
+# (например, «Ничего из этого»).
+#
+# ID разделов, вопросов и вариантов используются в knowledge.yaml (match/when),
+# поэтому их нельзя менять без правки базы знаний. Двоеточие в ID запрещено.
+
+categories:
+  - id: benefits
+    title: "🎁 Льготы"
+    intro: "Расскажу, что положено приезжему студенту: проезд, соцстипендия, материальная помощь, поликлиника и регистрация. Сначала пара вопросов о тебе."
+    questions: [university, study_form, study_basis, origin, housing, social_status]
+
+  - id: scholarships
+    title: "🎓 Стипендии"
+    intro: "Подскажу, какие стипендии тебе доступны и как поднять свою: от базовой до именных. Ответь на несколько вопросов."
+    questions: [university, study_form, study_basis, course, grades, achievements, social_status]
+
+  - id: leisure
+    title: "🎭 Досуг и скидки"
+    intro: "Покажу, где студенту отдохнуть бесплатно или со скидкой. Всего два вопроса."
+    questions: [age, interests]
+
+questions:
+  - id: university
+    label: "Вуз"
+    text: "В каком вузе ты учишься?"
+    options:
+      - {id: spbu, title: "СПбГУ"}
+      - {id: hse, title: "ВШЭ СПб"}
+      - {id: mining, title: "Горный"}
+      - {id: itmo, title: "ИТМО"}
+      - {id: polytech, title: "Политех"}
+      - {id: other, title: "Другой вуз"}
+
+  - id: study_form
+    label: "Форма обучения"
+    text: "На какой форме обучения ты учишься?"
+    options:
+      - {id: full_time, title: "Очная"}
+      - {id: part_time, title: "Очно-заочная или заочная"}
+
+  - id: study_basis
+    label: "Основа обучения"
+    text: "Ты учишься на бюджете или на платном?"
+    options:
+      - {id: budget, title: "Бюджет"}
+      - {id: contract, title: "Платное (контракт)"}
+
+  - id: course
+    label: "Курс"
+    text: "На каком ты курсе?"
+    options:
+      - {id: "1", title: "1 курс"}
+      - {id: "2", title: "2 курс"}
+      - {id: "3plus", title: "3 курс и старше"}
+
+  - id: grades
+    label: "Последняя сессия"
+    text: "Как ты закрыл(а) последнюю сессию?"
+    options:
+      - {id: excellent, title: "Только «отлично»"}
+      - {id: good, title: "На «хорошо» и «отлично»"}
+      - {id: satisfactory, title: "Есть «удовлетворительно»"}
+      - {id: none, title: "Сессии ещё не было"}
+
+  - id: achievements
+    label: "Достижения"
+    text: "Какие у тебя есть достижения за последний год?"
+    multi: true
+    options:
+      - {id: olympiads, title: "Олимпиады и конкурсы"}
+      - {id: science, title: "Статьи, конференции, гранты"}
+      - {id: social, title: "Волонтёрство, студсовет"}
+      - {id: sport, title: "Спорт"}
+      - {id: culture, title: "Творчество"}
+      - {id: none, title: "Пока ничего", exclusive: true}
+
+  - id: origin
+    label: "Откуда"
+    text: "Откуда ты приехал(а) учиться?"
+    options:
+      - {id: other_region, title: "Из другого региона России"}
+      - {id: local, title: "Я из Петербурга или Ленобласти"}
+
+  - id: housing
+    label: "Жильё"
+    text: "Где ты сейчас живёшь?"
+    options:
+      - {id: dorm, title: "В общежитии"}
+      - {id: renting, title: "Снимаю жильё"}
+      - {id: family, title: "У родных или в своём жилье"}
+
+  - id: social_status
+    label: "Особые обстоятельства"
+    text: "Отметь, что к тебе относится: это нужно, чтобы найти соцвыплаты. Удалить ответы можно в любой момент в «Моя анкета»."
+    multi: true
+    options:
+      - {id: orphan, title: "Сирота или без попечения родителей"}
+      - {id: disability, title: "Есть инвалидность"}
+      - {id: low_income, title: "Семья с низким доходом"}
+      - {id: many_children, title: "Многодетная семья"}
+      - {id: pensioner_parents, title: "Родители-пенсионеры"}
+      - {id: none, title: "Ничего из этого", exclusive: true}
+
+  - id: age
+    label: "Возраст"
+    text: "Сколько тебе лет?"
+    options:
+      - {id: under_23, title: "22 или меньше"}
+      - {id: over_22, title: "23 и больше"}
+
+  - id: interests
+    label: "Интересы"
+    text: "Что тебе интересно?"
+    multi: true
+    options:
+      - {id: museums, title: "Музеи и выставки"}
+      - {id: theatre, title: "Театр, концерты, кино"}
+      - {id: trips, title: "Поездки за город"}
+      - {id: sport, title: "Спорт"}

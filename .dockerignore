@@ -1,0 +1,9 @@
+.git
+.github
+.env
+*.md
+deploy
+docker-compose.yml
+**/*_test.go
+.golangci.yml
+.hadolint.yaml

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<yandexsearch version="1.0">
+<response>
+<results><grouping>
+<group><doc>
+  <url>https://metro.spb.ru/ticket.html</url>
+  <title>Льготный <hlword>проездной</hlword> для студентов</title>
+  <passages>
+    <passage>Стоимость <hlword>проездного</hlword> 1599 рублей.</passage>
+    <passage>Оформить можно в кассе.</passage>
+  </passages>
+</doc></group>
+<group><doc>
+  <url>https://ekp.spb.ru/</url>
+  <title>ЕКП</title>
+</doc></group>
+</grouping></results>
+</response>
+</yandexsearch>

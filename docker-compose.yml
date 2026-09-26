@@ -1,0 +1,84 @@
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  bot:
+    # Locally `docker compose up --build` builds the image. On the server the
+    # deploy script loads a prebuilt image and sets BOT_IMAGE to its tag.
+    build: .
+    image: ${BOT_IMAGE:-max-benefits-bot:local}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_ADDR: redis:6379
+      DATABASE_URL: postgres://benefits:${POSTGRES_PASSWORD:-benefits}@postgres:5432/benefits?sslmode=disable
+      # The bot takes the drafts the agent writes into drafts/ and asks the
+      # admins to review them (until the two talk through Kafka).
+      DRAFTS_INBOX: /app/drafts
+    # The questionnaire is mounted, so it can be edited without rebuilding
+    # the image: `docker compose restart bot`. knowledge.yaml only fills an
+    # empty database; after that cards change through the admin screens.
+    volumes:
+      - ./data:/app/data:ro
+      - ./drafts:/app/drafts
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Lets the bot finish events it already took from MAX.
+    stop_grace_period: 30s
+    logging: *logging
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # Append-only file: questionnaire progress survives Redis restarts.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  # Cards and the agent's drafts. Published on localhost:5432 for
+  # go run ./cmd/cli -db and the database tests.
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: benefits
+      POSTGRES_DB: benefits
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits}
+    ports:
+      - 127.0.0.1:5432:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benefits -d benefits"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  # Free metasearch for the agent when there is no Yandex Search API key.
+  # Only started on request: docker compose --profile agent up -d searxng
+  searxng:
+    image: searxng/searxng:2026.9.25-12f8b6515
+    profiles: [agent]
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8888:8080
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    logging: *logging
+
+volumes:
+  redis-data:
+  postgres-data:

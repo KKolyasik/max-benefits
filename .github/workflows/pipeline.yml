@@ -1,0 +1,228 @@
+# CI/CD «Навигатора студента»: один пайплайн на пуш в main, на пул-реквест в
+# main и на ручной запуск (Actions → pipeline → Run workflow, на любой ветке
+# или теге).
+#
+#   lint ─┐
+#         ├─▶ build ─▶ deploy
+#   test ─┘
+#
+#   lint   — golangci-lint (.golangci.yml), hadolint для Dockerfile, actionlint
+#            для этого файла;
+#   test   — go test с -race и покрытием, тесты базы — на Postgres из services;
+#   build  — образ linux/amd64 с тегом <sha коммита>; в Docker Hub уходит всё,
+#            кроме пул-реквестов, когда Docker Hub настроен;
+#   deploy — выкатка на сервер, как manual-джоба в GitLab: окружение production
+#            требует подтверждения, и джоба ждёт кнопку.
+#
+# Настройки — в README, раздел «CI/CD и деплой»: переменные DOCKERHUB_USERNAME,
+# IMAGE, DEPLOY_HOST, DEPLOY_USER, DEPLOY_HOST_FINGERPRINT, DEPLOY_PATH,
+# WEBHOOK_URL и секреты DOCKERHUB_TOKEN, DEPLOY_SSH_KEY. Токен бота, пароль
+# Postgres и секрет вебхука хранятся только на сервере, в .env.
+
+name: pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  # A new push makes the checks of a pull request pointless; runs of main
+  # are kept, each of them may be deployed.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: golangci-lint
+        run: docker run --rm -v "$PWD:/app" -w /app golangci/golangci-lint:v2.13.2 golangci-lint run ./...
+      - name: hadolint
+        run: docker run --rm -v "$PWD:/app" -w /app hadolint/hadolint:v2.15.1-debian hadolint Dockerfile
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Each database test creates a database of its own there.
+      TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: pdftotext
+        # The agent reads PDF with it; without it the PDF test is skipped.
+        run: sudo apt-get install -y --no-install-recommends poppler-utils
+      - name: go test
+        run: |
+          go test -race -count=1 -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -n 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    env:
+      # Pull requests are only built; so is everything until Docker Hub is
+      # set up, e.g. in a fork.
+      PUSH: ${{ github.event_name != 'pull_request' && vars.DOCKERHUB_USERNAME != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: image name
+        id: image
+        # The tag is the commit, so a deploy takes exactly what was tested.
+        run: echo "name=${{ vars.IMAGE || 'max-benefits-bot' }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: env.PUSH == 'true'
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.image.outputs.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    # Pull requests are only checked. Without DEPLOY_HOST the repository is
+    # not set up for deploys yet, e.g. in a fork.
+    if: github.event_name != 'pull_request' && vars.DEPLOY_HOST != ''
+    runs-on: ubuntu-24.04
+    environment: production
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    env:
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/max-benefits' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: upload compose file
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # The server's host key: guards against a spoofed server. ECDSA,
+          # since the Go SSH client of appleboy/* picks this key type.
+          fingerprint: ${{ vars.DEPLOY_HOST_FINGERPRINT }}
+          source: deploy/docker-compose.prod.yml
+          target: ${{ env.DEPLOY_PATH }}
+          strip_components: 1
+      - name: release
+        uses: appleboy/ssh-action@v1
+        env:
+          RELEASE_IMAGE: ${{ needs.build.outputs.image }}
+          RELEASE_REF: ${{ github.ref_name }}
+          WEBHOOK_URL: ${{ vars.WEBHOOK_URL }}
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ vars.DEPLOY_HOST_FINGERPRINT }}
+          envs: RELEASE_IMAGE,RELEASE_REF,WEBHOOK_URL,DEPLOY_PATH
+          script: |
+            set -eu
+            if ! printf '%s' "$RELEASE_IMAGE" | grep -Eqx '[a-z0-9._/-]+:[0-9a-f]{40}'; then
+              echo "Bad image '$RELEASE_IMAGE' from CI"
+              exit 1
+            fi
+            case "$WEBHOOK_URL" in
+              https://*) ;;
+              *) echo "Set the WEBHOOK_URL variable of the repository to the https address of the webhook"; exit 1 ;;
+            esac
+
+            cd "$DEPLOY_PATH"
+            # .env holds the image tag, the webhook address, the bot token
+            # and the secrets; compose reads it both for the container and
+            # for ${BOT_IMAGE} and the like in the file.
+            compose="docker compose -p max-benefits -f docker-compose.prod.yml"
+            previous=$(sed -n 's/^BOT_IMAGE=//p' .env 2>/dev/null || true)
+            if ! grep -q '^MAX_BOT_TOKEN=.' .env 2>/dev/null; then
+              echo "Put MAX_BOT_TOKEN=... into $DEPLOY_PATH/.env on the server"
+              exit 1
+            fi
+            echo "Deploying $RELEASE_IMAGE from $RELEASE_REF (was: ${previous:-nothing})"
+
+            # Pull first: a missing image must not touch the running bot.
+            if ! docker pull -q "$RELEASE_IMAGE"; then
+              echo "Image $RELEASE_IMAGE not found: the build job pushes images only for main and manual runs."
+              exit 1
+            fi
+
+            umask 077
+            # Postgres takes its password on the first start, and the compose
+            # file needs it and the webhook address even for a rollback, so
+            # they are set before the copy for rollbacks is made.
+            if ! grep -q '^POSTGRES_PASSWORD=.' .env; then
+              printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env
+            fi
+            grep -v '^WEBHOOK_URL=' .env > .env.next
+            printf 'WEBHOOK_URL=%s\n' "$WEBHOOK_URL" >> .env.next
+            mv .env.next .env
+            cp .env .env.previous
+            # Only the image tag changes: the token, the secrets and any
+            # settings added on the server by hand are kept.
+            grep -v '^BOT_IMAGE=' .env.previous > .env
+            printf 'BOT_IMAGE=%s\n' "$RELEASE_IMAGE" >> .env
+            # MAX sends this secret with every webhook request, and the bot
+            # registers it in MAX itself, so any random value will do.
+            if ! grep -q '^WEBHOOK_SECRET=.' .env; then
+              printf 'WEBHOOK_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env
+            fi
+            since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            $compose up -d --remove-orphans --force-recreate bot
+
+            # The bot logs "bot is running" once it reached Redis, Postgres
+            # and MAX.
+            for i in $(seq 30); do
+              if $compose logs --since "$since" bot | grep -q '"bot is running"'; then
+                echo "$RELEASE_IMAGE from $RELEASE_REF, deployed $(date -u +%FT%TZ)" > VERSION
+                # Keep only the current and the previous image for rollbacks.
+                docker images "${RELEASE_IMAGE%:*}" --format '{{.Repository}}:{{.Tag}}' \
+                  | grep -vx -e "$RELEASE_IMAGE" -e "${previous:-none}" \
+                  | xargs -r docker image rm > /dev/null || true
+                echo "Deployed $RELEASE_IMAGE after $((i * 2)) s"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "The bot did not start, last logs:"
+            $compose logs --since "$since" --tail 30 bot
+            if [ -n "$previous" ]; then
+              echo "Rolling back to $previous"
+              mv .env.previous .env
+              $compose up -d --force-recreate bot
+            fi
+            exit 1
