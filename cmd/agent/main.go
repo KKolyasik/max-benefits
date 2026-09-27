@@ -1,6 +1,7 @@
 // Command agent keeps the knowledge base fresh: it searches the web by the
 // queries from data/queries.yaml, reads the found pages and asks a language
-// model to draft cards into drafts/:
+// model to draft cards. The drafts go to the bot through Kafka, or into
+// drafts/ when Kafka is not set up:
 //
 //	go run ./cmd/agent collect
 //
@@ -11,8 +12,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,6 +29,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sr"
+
+	"github.com/KKolyasik/max-benefits/contract"
 	"github.com/KKolyasik/max-benefits/internal/agent"
 	"github.com/KKolyasik/max-benefits/internal/agent/fetch"
 	"github.com/KKolyasik/max-benefits/internal/agent/llm"
@@ -67,6 +75,10 @@ type config struct {
 	YandexAsync bool
 	// TokenLimit caps the model tokens of a run; 0 means no limit.
 	TokenLimit int
+	// KafkaBrokers and SchemaRegistryURL send drafts to the bot; without
+	// them drafts go into DraftsDir.
+	KafkaBrokers      []string
+	SchemaRegistryURL string
 	// CAFile is an extra root certificate for reading sites: many Russian
 	// official sites use the Russian Trusted Root CA.
 	CAFile   string
@@ -155,8 +167,15 @@ func collect(ctx context.Context, cfg config, force bool) error {
 		parallel, mode = 8, "yandex async"
 	}
 
+	// Before anything costs money: without Kafka the drafts would be lost.
+	sink, closeSink, err := openSink(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer closeSink()
+
 	log.Info("collecting", "queries", len(queries), "search", cfg.SearchProvider, "model", cfg.LLMModel, "mode", mode,
-		"token_limit", cfg.TokenLimit)
+		"token_limit", cfg.TokenLimit, "kafka", len(cfg.KafkaBrokers) > 0)
 	c := &agent.Collector{
 		Survey:     sv,
 		Base:       base,
@@ -164,7 +183,7 @@ func collect(ctx context.Context, cfg config, force bool) error {
 		Search:     searcher,
 		Fetch:      &fetch.Fetcher{HTTP: web, MaxChars: 5000, PDFToText: pdftotext},
 		Model:      model,
-		Drafts:     agent.Drafts{Dir: cfg.DraftsDir},
+		Drafts:     sink,
 		State:      state,
 		Force:      force,
 		Parallel:   parallel,
@@ -175,8 +194,12 @@ func collect(ctx context.Context, cfg config, force bool) error {
 	fmt.Printf("\nЗапросов: %d, без изменений: %d, с ошибкой: %d, отложено: %d, новых черновиков: %d.\n",
 		report.Queries, report.Unchanged, report.Failed, report.Deferred, len(report.Drafts))
 	fmt.Printf("Токены модели: %d на входе, %d на выходе.\n", report.InputTokens, report.OutputTokens)
-	if len(report.Drafts) > 0 {
-		fmt.Println("Бот заберёт черновики из " + cfg.DraftsDir + " и покажет их админам.")
+	switch {
+	case len(report.Drafts) == 0:
+	case len(cfg.KafkaBrokers) > 0:
+		fmt.Println("Черновики ушли боту через Kafka: админы увидят их в чате.")
+	default:
+		fmt.Println("Черновики лежат в " + cfg.DraftsDir + ": без Kafka бот их не увидит.")
 	}
 	if err != nil {
 		return err
@@ -214,16 +237,18 @@ func loadBase(cfg config) (*survey.Survey, []knowledge.Card, error) {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		SurveyFile:     env("SURVEY_FILE", "data/survey.yaml"),
-		KnowledgeFile:  env("KNOWLEDGE_FILE", "data/knowledge.yaml"),
-		QueriesFile:    env("QUERIES_FILE", "data/queries.yaml"),
-		DraftsDir:      env("DRAFTS_DIR", "drafts"),
-		SearXNGURL:     env("SEARXNG_URL", "http://localhost:8888"),
-		YandexAPIKey:   os.Getenv("YANDEX_API_KEY"),
-		YandexFolderID: os.Getenv("YANDEX_FOLDER_ID"),
-		YandexRegion:   2,
-		LLMBaseURL:     env("LLM_BASE_URL", yandexLLMURL),
-		CAFile:         env("CA_FILE", "certs/russian_trusted_root_ca.pem"),
+		SurveyFile:        env("SURVEY_FILE", "data/survey.yaml"),
+		KnowledgeFile:     env("KNOWLEDGE_FILE", "data/knowledge.yaml"),
+		QueriesFile:       env("QUERIES_FILE", "data/queries.yaml"),
+		DraftsDir:         env("DRAFTS_DIR", "drafts"),
+		SearXNGURL:        env("SEARXNG_URL", "http://localhost:8888"),
+		YandexAPIKey:      os.Getenv("YANDEX_API_KEY"),
+		YandexFolderID:    os.Getenv("YANDEX_FOLDER_ID"),
+		YandexRegion:      2,
+		LLMBaseURL:        env("LLM_BASE_URL", yandexLLMURL),
+		CAFile:            env("CA_FILE", "certs/russian_trusted_root_ca.pem"),
+		KafkaBrokers:      splitList(os.Getenv("KAFKA_BROKERS")),
+		SchemaRegistryURL: os.Getenv("SCHEMA_REGISTRY_URL"),
 	}
 	cfg.StateFile = env("STATE_FILE", cfg.DraftsDir+"/.seen.json")
 	// Without a Yandex key the agent still works, on the free search.
@@ -255,6 +280,9 @@ func loadConfig() (config, error) {
 	cfg.YandexAsync = cfg.YandexAsync && onYandex
 	if cfg.TokenLimit, err = strconv.Atoi(env("LLM_TOKEN_LIMIT", strconv.Itoa(defaultTokenLimit))); err != nil || cfg.TokenLimit < 0 {
 		return cfg, fmt.Errorf("LLM_TOKEN_LIMIT must be a number of tokens, 0 for no limit: %q", os.Getenv("LLM_TOKEN_LIMIT"))
+	}
+	if (len(cfg.KafkaBrokers) > 0) != (cfg.SchemaRegistryURL != "") {
+		return cfg, errors.New("KAFKA_BROKERS and SCHEMA_REGISTRY_URL go together: set both or neither")
 	}
 	if err := cfg.LogLevel.UnmarshalText([]byte(env("LOG_LEVEL", "info"))); err != nil {
 		return cfg, fmt.Errorf("LOG_LEVEL: %w", err)
@@ -357,4 +385,53 @@ func newLogger(cfg config) *slog.Logger {
 			return a
 		},
 	}))
+}
+
+// openSink sends drafts to the bot through Kafka: it makes sure the topics
+// and the schemas are there, so a broken Kafka stops the run before it
+// costs anything. Without Kafka the drafts go into files.
+func openSink(ctx context.Context, cfg config) (agent.Sink, func(), error) {
+	if len(cfg.KafkaBrokers) == 0 {
+		return agent.Drafts{Dir: cfg.DraftsDir}, func() {}, nil
+	}
+	// Without a delivery timeout a draft would wait for a dead Kafka forever.
+	cl, err := kgo.NewClient(kgo.SeedBrokers(cfg.KafkaBrokers...), kgo.RecordDeliveryTimeout(30*time.Second))
+	if err != nil {
+		return nil, nil, fmt.Errorf("kafka: %w", err)
+	}
+	reg, err := sr.NewClient(sr.URLs(cfg.SchemaRegistryURL))
+	if err != nil {
+		cl.Close()
+		return nil, nil, fmt.Errorf("schema registry: %w", err)
+	}
+	codec := contract.NewCodec(reg)
+	setup, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := contract.EnsureTopics(setup, kadm.NewClient(cl), contract.Topics...); err != nil {
+		cl.Close()
+		return nil, nil, fmt.Errorf("kafka: %w", err)
+	}
+	if err := codec.Register(setup); err != nil {
+		cl.Close()
+		return nil, nil, fmt.Errorf("schema registry: %w", err)
+	}
+	return &agent.KafkaSink{Client: cl, Codec: codec, RunID: runID()}, cl.Close, nil
+}
+
+// runID names a run by its start and a few random bytes.
+func runID() string {
+	b := make([]byte, 3)
+	_, _ = rand.Read(b)
+	return time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b)
+}
+
+// splitList splits a comma-separated list, dropping the blanks.
+func splitList(s string) []string {
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }

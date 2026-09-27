@@ -24,7 +24,7 @@ import (
 	"strings"
 
 	"github.com/KKolyasik/max-benefits/internal/bot"
-	"github.com/KKolyasik/max-benefits/internal/inbox"
+	"github.com/KKolyasik/max-benefits/internal/bus"
 	"github.com/KKolyasik/max-benefits/internal/knowledge"
 	"github.com/KKolyasik/max-benefits/internal/pgstore"
 	"github.com/KKolyasik/max-benefits/internal/session"
@@ -39,8 +39,9 @@ type options struct {
 	db string
 	// admin gives the console user admin rights.
 	admin bool
-	// drafts is a directory with the agent's drafts to import.
-	drafts string
+	// kafka and registry connect to the agent: its drafts come in as they
+	// are sent, and approved cards go out.
+	kafka, registry string
 }
 
 func main() {
@@ -49,7 +50,8 @@ func main() {
 	flag.StringVar(&o.kbFile, "knowledge", "data/knowledge.yaml", "knowledge base file; imported into an empty database")
 	flag.StringVar(&o.db, "db", os.Getenv("DATABASE_URL"), "PostgreSQL URL (default $DATABASE_URL)")
 	flag.BoolVar(&o.admin, "admin", false, "be an admin: review drafts (needs -db)")
-	flag.StringVar(&o.drafts, "drafts", "", "import the agent's drafts from this directory (needs -db)")
+	flag.StringVar(&o.kafka, "kafka", os.Getenv("KAFKA_BROKERS"), "Kafka brokers, comma-separated (default $KAFKA_BROKERS; needs -db)")
+	flag.StringVar(&o.registry, "registry", os.Getenv("SCHEMA_REGISTRY_URL"), "Schema Registry URL (default $SCHEMA_REGISTRY_URL)")
 	flag.Parse()
 
 	if err := run(o); err != nil {
@@ -85,22 +87,34 @@ func run(o options) error {
 		} else if n > 0 {
 			fmt.Println(dim(fmt.Sprintf("В пустую базу импортировано карточек: %d.", n)))
 		}
-		if o.drafts != "" {
-			n, err := inbox.Import(ctx, o.drafts, store, slog.New(slog.DiscardHandler))
-			if err != nil {
-				return err
-			}
-			fmt.Println(dim(fmt.Sprintf("Импортировано новых черновиков: %d.", n)))
-		}
 		kb = store
-	} else if o.admin || o.drafts != "" {
-		return errors.New("-admin and -drafts need a database: set -db or DATABASE_URL")
+	} else if o.admin || o.kafka != "" {
+		return errors.New("-admin and -kafka need a database: set -db or DATABASE_URL")
 	}
 
 	term := &console{}
 	b := bot.New(sv, kb, session.NewMemory(), term, slog.New(slog.DiscardHandler))
 	if o.admin {
 		b.WithModeration(store, []int64{userID})
+	}
+	if o.kafka != "" {
+		if o.registry == "" {
+			return errors.New("-kafka needs -registry or SCHEMA_REGISTRY_URL")
+		}
+		// A consumer group of its own: a bot running alongside gets every
+		// draft too.
+		busCtx, stopBus := context.WithCancel(ctx)
+		waitBus, err := bus.Start(busCtx, bus.Config{Brokers: strings.Split(o.kafka, ","), RegistryURL: o.registry, Group: "max-benefits-cli"},
+			store, sv, b.NotifyDrafts, slog.New(slog.DiscardHandler))
+		if err != nil {
+			stopBus()
+			return err
+		}
+		defer func() {
+			stopBus()
+			waitBus()
+		}()
+		fmt.Println(dim("Kafka подключена: черновики агента придут сами."))
 	}
 
 	fmt.Println(dim("Номер — нажать кнопку, текст — отправить сообщение, пустая строка или Ctrl+D — выход.\n"))

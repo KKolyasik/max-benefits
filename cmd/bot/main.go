@@ -22,8 +22,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/KKolyasik/max-benefits/internal/bot"
+	"github.com/KKolyasik/max-benefits/internal/bus"
 	"github.com/KKolyasik/max-benefits/internal/dispatch"
-	"github.com/KKolyasik/max-benefits/internal/inbox"
 	"github.com/KKolyasik/max-benefits/internal/knowledge"
 	"github.com/KKolyasik/max-benefits/internal/maxapi"
 	"github.com/KKolyasik/max-benefits/internal/pgstore"
@@ -59,12 +59,13 @@ type config struct {
 	// PostgreSQL, where admins publish the agent's drafts.
 	DatabaseURL string
 	AdminIDs    []int64
-	// DraftsInbox is a directory the agent writes drafts to; only for local
-	// runs until the agent and the bot talk through Kafka.
-	DraftsInbox string
-	Workers     int
-	LogLevel    slog.Level
-	LogJSON     bool
+	// KafkaBrokers and SchemaRegistryURL connect the bot to the agent: it
+	// takes the drafts and publishes the cards and the admins' decisions.
+	KafkaBrokers      []string
+	SchemaRegistryURL string
+	Workers           int
+	LogLevel          slog.Level
+	LogJSON           bool
 	// WebhookURL switches the bot from long polling to a webhook.
 	WebhookURL    string
 	WebhookPath   string
@@ -131,8 +132,22 @@ func run() error {
 	b := bot.New(sv, kb, store, client, log)
 	if cards != nil {
 		b.WithModeration(cards, cfg.AdminIDs)
-		if cfg.DraftsInbox != "" {
-			go inbox.Watch(ctx, cfg.DraftsInbox, 10*time.Second, cards, b.NotifyDrafts, log)
+		if len(cfg.KafkaBrokers) > 0 {
+			// Stopped before the database closes: the bus works with it.
+			busCtx, stopBus := context.WithCancel(ctx)
+			waitBus, err := bus.Start(busCtx,
+				bus.Config{Brokers: cfg.KafkaBrokers, RegistryURL: cfg.SchemaRegistryURL, Group: "max-benefits-bot"},
+				cards, sv, b.NotifyDrafts, log)
+			if err != nil {
+				stopBus()
+				return err
+			}
+			defer func() {
+				stopBus()
+				waitBus()
+			}()
+		} else {
+			log.Warn("KAFKA_BROKERS is not set: the agent's drafts don't come, and the agent doesn't learn the cards")
 		}
 	}
 	pool := dispatch.New(cfg.Workers, 64,
@@ -232,19 +247,20 @@ func openStore(ctx context.Context, cfg config, log *slog.Logger) (session.Store
 
 func loadConfig() (config, error) {
 	cfg := config{
-		Token:         os.Getenv("MAX_BOT_TOKEN"),
-		APIURL:        os.Getenv("MAX_API_URL"),
-		CAFile:        os.Getenv("MAX_CA_FILE"),
-		RedisAddr:     os.Getenv("REDIS_ADDR"),
-		RedisPassword: os.Getenv("REDIS_PASSWORD"),
-		SurveyFile:    env("SURVEY_FILE", "data/survey.yaml"),
-		KnowledgeFile: env("KNOWLEDGE_FILE", "data/knowledge.yaml"),
-		DatabaseURL:   os.Getenv("DATABASE_URL"),
-		DraftsInbox:   os.Getenv("DRAFTS_INBOX"),
-		LogJSON:       strings.EqualFold(os.Getenv("LOG_FORMAT"), "json"),
-		WebhookURL:    os.Getenv("WEBHOOK_URL"),
-		WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
-		HTTPAddr:      env("HTTP_ADDR", ":8080"),
+		Token:             os.Getenv("MAX_BOT_TOKEN"),
+		APIURL:            os.Getenv("MAX_API_URL"),
+		CAFile:            os.Getenv("MAX_CA_FILE"),
+		RedisAddr:         os.Getenv("REDIS_ADDR"),
+		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
+		SurveyFile:        env("SURVEY_FILE", "data/survey.yaml"),
+		KnowledgeFile:     env("KNOWLEDGE_FILE", "data/knowledge.yaml"),
+		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		KafkaBrokers:      splitList(os.Getenv("KAFKA_BROKERS")),
+		SchemaRegistryURL: os.Getenv("SCHEMA_REGISTRY_URL"),
+		LogJSON:           strings.EqualFold(os.Getenv("LOG_FORMAT"), "json"),
+		WebhookURL:        os.Getenv("WEBHOOK_URL"),
+		WebhookSecret:     os.Getenv("WEBHOOK_SECRET"),
+		HTTPAddr:          env("HTTP_ADDR", ":8080"),
 	}
 	var errs []error
 	if cfg.Token == "" {
@@ -262,6 +278,12 @@ func loadConfig() (config, error) {
 	}
 	if cfg.AdminIDs, err = parseIDs(os.Getenv("ADMIN_IDS")); err != nil {
 		errs = append(errs, fmt.Errorf("ADMIN_IDS: %w", err))
+	}
+	switch {
+	case (len(cfg.KafkaBrokers) > 0) != (cfg.SchemaRegistryURL != ""):
+		errs = append(errs, errors.New("KAFKA_BROKERS and SCHEMA_REGISTRY_URL go together: set both or neither"))
+	case len(cfg.KafkaBrokers) > 0 && cfg.DatabaseURL == "":
+		errs = append(errs, errors.New("KAFKA_BROKERS needs DATABASE_URL: drafts and the outbox live in the database"))
 	}
 	if err = cfg.LogLevel.UnmarshalText([]byte(env("LOG_LEVEL", "info"))); err != nil {
 		errs = append(errs, fmt.Errorf("LOG_LEVEL: %w", err))
@@ -318,6 +340,17 @@ func parseIDs(s string) ([]int64, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// splitList splits a comma-separated list, dropping the blanks.
+func splitList(s string) []string {
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func env(key, fallback string) string {

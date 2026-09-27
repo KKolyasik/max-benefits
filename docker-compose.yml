@@ -15,19 +15,21 @@ services:
     environment:
       REDIS_ADDR: redis:6379
       DATABASE_URL: postgres://benefits:${POSTGRES_PASSWORD:-benefits}@postgres:5432/benefits?sslmode=disable
-      # The bot takes the drafts the agent writes into drafts/ and asks the
-      # admins to review them (until the two talk through Kafka).
-      DRAFTS_INBOX: /app/drafts
+      # The agent's drafts come through Kafka; the cards and the admins'
+      # decisions go back.
+      KAFKA_BROKERS: kafka:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     # The questionnaire is mounted, so it can be edited without rebuilding
     # the image: `docker compose restart bot`. knowledge.yaml only fills an
     # empty database; after that cards change through the admin screens.
     volumes:
       - ./data:/app/data:ro
-      - ./drafts:/app/drafts
     depends_on:
       redis:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      schema-registry:
         condition: service_healthy
     # Lets the bot finish events it already took from MAX.
     stop_grace_period: 30s
@@ -80,12 +82,10 @@ services:
     logging: *logging
 
   # Kafka between the bot and the agent: one broker in KRaft mode, without
-  # ZooKeeper. Services in compose reach it at kafka:19092, programs and
-  # tests on the host at localhost:9092. Until the services use it, only
-  # started on request: docker compose up -d --wait kafka schema-registry
+  # ZooKeeper. Services in compose reach it at kafka:19092, the agent and
+  # tests on the host at localhost:9092.
   kafka:
     image: apache/kafka:4.3.1
-    profiles: [kafka]
     restart: unless-stopped
     environment:
       KAFKA_NODE_ID: 1
@@ -120,7 +120,6 @@ services:
   # topic), and refuses incompatible versions, see contract/.
   schema-registry:
     image: confluentinc/cp-schema-registry:8.3.2
-    profiles: [kafka]
     restart: unless-stopped
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry

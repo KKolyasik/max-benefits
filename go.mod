@@ -12,6 +12,7 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/twmb/franz-go v1.22.0
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
+	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260927044826-460b6323ec8b
 	github.com/twmb/franz-go/pkg/sr v1.8.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/net v0.59.0
