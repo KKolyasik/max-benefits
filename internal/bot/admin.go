@@ -1,11 +1,13 @@
 package bot
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KKolyasik/max-benefits/internal/knowledge"
 	"github.com/KKolyasik/max-benefits/internal/moderation"
@@ -37,18 +39,49 @@ func (b *Bot) isAdmin(userID int64) bool {
 	return b.mod != nil && b.admins[userID]
 }
 
-// NotifyDrafts tells the admins that the agent sent new drafts.
-func (b *Bot) NotifyDrafts(ctx context.Context, added int) error {
-	if b.mod == nil || added == 0 {
+// Agent is the agent that drafts the cards.
+type Agent interface {
+	// RunAgent asks the agent to run now; force makes it read the pages
+	// that did not change too.
+	RunAgent(ctx context.Context, force bool) error
+}
+
+// WithAgent lets the admins run the agent from the chat.
+func (b *Bot) WithAgent(a Agent) *Bot {
+	b.agent = a
+	return b
+}
+
+// NotifyRun tells the admins how a run of the agent goes: that it started,
+// if an admin started it, and how it ended. At night the news comes without
+// a sound.
+func (b *Bot) NotifyRun(ctx context.Context, r moderation.Run) error {
+	if b.mod == nil {
 		return nil
 	}
-	pending, err := b.mod.PendingDrafts(ctx)
-	if err != nil {
-		return err
+	var msg Message
+	switch r.Status {
+	case moderation.RunStarted:
+		if r.Trigger != moderation.ByCommand {
+			return nil
+		}
+		msg.Text = textRunStarted
+	case moderation.RunBusy:
+		msg.Text = textRunBusy
+	case moderation.RunDone, moderation.RunFailed:
+		pending, err := b.mod.PendingDrafts(ctx)
+		if err != nil {
+			return err
+		}
+		msg.Text = runText(r, pending)
+		if pending > 0 {
+			msg.Keyboard = [][]Button{{{Text: labelReview, Payload: actDrafts}}}
+		}
+	default:
+		return nil
 	}
-	msg := Message{
-		Text:     fmt.Sprintf("🆕 Агент прислал новые черновики: %d. На проверке всего: %d.", added, pending),
-		Keyboard: [][]Button{{{Text: labelReview, Payload: actDrafts}}},
+	if h := b.now().Hour(); h >= 22 || h < 8 {
+		msg.Silent = true
 	}
 	var errs []error
 	for id := range b.admins {
@@ -59,15 +92,75 @@ func (b *Bot) NotifyDrafts(ctx context.Context, added int) error {
 	return errors.Join(errs...)
 }
 
+// runText tells how a run ended.
+func runText(r moderation.Run, pending int) string {
+	how := map[moderation.Trigger]string{
+		moderation.BySchedule: " по расписанию",
+		moderation.ByCommand:  " по кнопке",
+		moderation.FromCLI:    " из консоли",
+	}[r.Trigger]
+	var sb strings.Builder
+	if r.Status == moderation.RunFailed {
+		fmt.Fprintf(&sb, "⚠️ Прогон агента%s сорвался.\nПричина: %s", how, cmp.Or(r.Error, "неизвестна"))
+	} else {
+		fmt.Fprintf(&sb, "🤖 Агент закончил прогон%s.", how)
+	}
+	if r.Queries > 0 {
+		fmt.Fprintf(&sb, "\nЗапросов: %d, без изменений: %d", r.Queries, r.Unchanged)
+		if r.Failed > 0 {
+			fmt.Fprintf(&sb, ", с ошибкой: %d", r.Failed)
+		}
+		sb.WriteString(".")
+	}
+	if r.Deferred > 0 {
+		fmt.Fprintf(&sb, "\nОтложено до следующего прогона, кончился лимит токенов: %d.", r.Deferred)
+	}
+	fmt.Fprintf(&sb, "\nЧерновиков прислал: %d, на проверке всего: %d.", r.Drafts, pending)
+	if tokens := r.InputTokens + r.OutputTokens; tokens > 0 {
+		fmt.Fprintf(&sb, "\nТокенов модели: %s.", groupDigits(tokens))
+	}
+	return sb.String()
+}
+
+// groupDigits writes a number with its thousands apart: 120 000.
+func groupDigits(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	var sb strings.Builder
+	for i, r := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+func agentMessage() Message {
+	return Message{Text: textAgent, Keyboard: [][]Button{
+		{{Text: labelRun, Payload: actRun}},
+		{{Text: labelRunForce, Payload: payload(actRun, "force")}},
+		{{Text: labelMenu, Payload: actMenu}},
+	}}
+}
+
 // onAdmin handles the admin buttons. For anyone else they are stale.
 func (b *Bot) onAdmin(ctx context.Context, ev Event, action, arg string) (reply, error) {
 	if !b.isAdmin(ev.UserID) {
 		return stale(ev), nil
 	}
-	if action == actDrafts {
+	switch action {
+	case actDrafts:
 		r, err := b.nextDraft(ctx, 0)
 		r.answer = freeze(ev, labelDrafts)
 		return r, err
+	case actAgent, actRun:
+		if b.agent == nil {
+			return stale(ev), nil
+		}
+		if action == actAgent {
+			return reply{answer: freeze(ev, labelAgent), messages: []Message{agentMessage()}}, nil
+		}
+		return b.runAgent(ctx, ev, arg == "force"), nil
 	}
 
 	id, err := strconv.ParseInt(arg, 10, 64)
@@ -213,4 +306,22 @@ func (b *Bot) draftControls(d moderation.Draft, current *knowledge.Card, problem
 		{{Text: labelSkip, Payload: payload(actSkip, id)}},
 		{{Text: labelMenu, Payload: actMenu}},
 	}}
+}
+
+// runAgent passes the command to the agent. The agent answers later, when
+// it starts: NotifyRun.
+func (b *Bot) runAgent(ctx context.Context, ev Event, force bool) reply {
+	choice := labelRun
+	if force {
+		choice = labelRunForce
+	}
+	back := [][]Button{{{Text: labelMenu, Payload: actMenu}}}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := b.agent.RunAgent(ctx, force); err != nil {
+		b.log.Error("run the agent", "admin", ev.UserID, "err", err)
+		return reply{answer: freeze(ev, choice), messages: []Message{{Text: textAgentDown, Keyboard: back}}}
+	}
+	b.log.Info("the agent is asked to run", "admin", ev.UserID, "force", force)
+	return reply{answer: freeze(ev, choice), messages: []Message{{Text: textAgentSent, Keyboard: back}}}
 }

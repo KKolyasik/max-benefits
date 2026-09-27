@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+
+# The agent as a service: agent serve. Built like the bot's image, see
+# Dockerfile: docker build --platform linux/amd64 -f Dockerfile.agent .
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+ARG TARGETOS TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+COPY contract ./contract
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/agent ./cmd/agent
+
+FROM alpine:3.22
+# pdftotext reads PDF documents; tzdata gives the schedule its time zone.
+RUN apk add --no-cache ca-certificates tzdata poppler-utils \
+    && adduser -D -H -u 10001 agent \
+    && mkdir /data && chown agent /data
+WORKDIR /app
+COPY --from=build /out/agent ./agent
+# The survey and the cards come from the bot; the queries are the agent's.
+COPY data/queries.yaml ./data/
+# Many Russian official sites use certificates of this CA.
+COPY certs/russian_trusted_root_ca.pem ./certs/
+# /data keeps what the agent read last time, so unchanged pages don't go to
+# the model again after a restart.
+ENV STATE_FILE=/data/seen.json \
+    LOG_FORMAT=json \
+    TZ=Europe/Moscow
+VOLUME /data
+USER 10001
+ENTRYPOINT ["/app/agent"]
+CMD ["serve"]

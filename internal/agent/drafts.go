@@ -27,6 +27,10 @@ const draftHeader = `# Черновик карточки от агента, за
 
 `
 
+// ErrSink means drafts can't be delivered: the run stops rather than spend
+// tokens on drafts nobody gets.
+var ErrSink = errors.New("drafts can't be delivered")
+
 // Sink takes the drafts of a run.
 type Sink interface {
 	// Write keeps a draft and says where it went; false means a draft of
@@ -46,6 +50,14 @@ type Draft struct {
 	// Notes are problems the agent could not fix; the reviewer has to.
 	Notes []string       `yaml:"notes,omitempty"`
 	Card  knowledge.Card `yaml:"-"`
+}
+
+// DraftID derives the ID of a draft from what it proposes: the card and the
+// card it rewrites. So the same proposal sent again is one draft for the
+// bot, and a rejected one stays rejected.
+func DraftID(d Draft) string {
+	sum := sha256.Sum256([]byte(d.Updates + "\n" + knowledge.MarshalCard(d.Card)))
+	return hex.EncodeToString(sum[:])
 }
 
 type draftFile struct {

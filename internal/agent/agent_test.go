@@ -217,6 +217,48 @@ func TestPendingDraftIsNotOverwritten(t *testing.T) {
 	}
 }
 
+// A proposal admins rejected is not sent again, while another one is.
+func TestRejectedDraftIsNotSent(t *testing.T) {
+	// The second run asks twice: the first answer repeats the rejected card.
+	c := newCollector(t, &fakeModel{answers: [][]map[string]any{{card(nil)}, {card(nil)}, {card(map[string]any{"summary": "Другое."})}}})
+	if _, err := c.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := drafts(t, c)[0]
+	if err := c.Drafts.(Drafts).Delete(first); err != nil {
+		t.Fatal(err)
+	}
+	c.Rejected = map[string]bool{DraftID(first): true}
+	c.Force = true
+	c.Queries = append(c.Queries, c.Queries[0])
+	c.Parallel = 1
+	r, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Drafts) != 1 || drafts(t, c)[0].Card.Summary != "Другое." {
+		t.Errorf("only the new proposal must be sent: %+v", r)
+	}
+}
+
+// The ID stands for the proposal: when and by which query it was found
+// doesn't matter, what it proposes does.
+func TestDraftID(t *testing.T) {
+	d := Draft{Query: "проездной", Updates: "transport", Card: transport}
+	again := d
+	again.Query, again.FoundAt, again.Sources = "другой запрос", time.Now(), []string{"https://other.example"}
+	if DraftID(d) != DraftID(again) {
+		t.Error("the same proposal must keep its ID")
+	}
+	changed := d
+	changed.Card.Summary = "другой текст"
+	asNew := d
+	asNew.Updates = ""
+	if DraftID(changed) == DraftID(d) || DraftID(asNew) == DraftID(d) {
+		t.Error("another proposal must get another ID")
+	}
+}
+
 func TestModelFixesErrorsOnSecondTry(t *testing.T) {
 	bad := card(map[string]any{"match": []string{"age=young"}})
 	model := &fakeModel{answers: [][]map[string]any{{bad}, {card(nil)}}}

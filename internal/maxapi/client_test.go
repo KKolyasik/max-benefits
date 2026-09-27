@@ -224,7 +224,7 @@ func TestSendMessageWithKeyboard(t *testing.T) {
 	if r.query["user_id"] != "123" || r.query["disable_link_preview"] != "true" {
 		t.Errorf("unexpected query: %v", r.query)
 	}
-	if r.body["text"] != "**Привет**" || r.body["format"] != "markdown" {
+	if _, set := r.body["notify"]; r.body["text"] != "**Привет**" || r.body["format"] != "markdown" || set {
 		t.Errorf("unexpected body: %v", r.body)
 	}
 	kb := r.body["attachments"].([]any)[0].(map[string]any)
@@ -238,6 +238,17 @@ func TestSendMessageWithKeyboard(t *testing.T) {
 	}
 	if link["type"] != "link" || link["url"] != "https://max.ru" {
 		t.Errorf("bad link button: %v", link)
+	}
+}
+
+func TestSendSilently(t *testing.T) {
+	fake := &fakeMAX{t: t}
+	c := newTestClient(t, fake)
+	if err := c.Send(context.Background(), 123, bot.Message{Text: "ночной отчёт", Silent: true}); err != nil {
+		t.Fatal(err)
+	}
+	if r := fake.sent("/messages")[0]; r.body["notify"] != false {
+		t.Errorf("a silent message must not notify: %v", r.body)
 	}
 }
 

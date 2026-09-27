@@ -61,6 +61,9 @@ const (
 	labelReject    = "❌ Отклонить"
 	labelSkip      = "⏭ Пропустить"
 	labelFromStart = "🔄 Сначала"
+	labelAgent     = "🤖 Агент"
+	labelRun       = "▶️ Запустить"
+	labelRunForce  = "🔁 Перечитать всё"
 
 	textNoDrafts    = "Черновиков на проверке нет 🎉"
 	textLastDraft   = "Это был последний черновик. Пропущенные ждут проверки: %d."
@@ -70,16 +73,30 @@ const (
 	textSkipped     = "⏭ Пропущено"
 	textDecided     = "Этот черновик уже разобран"
 	textCantApprove = "⛔ Одобрить нельзя: база или анкета изменились"
+
+	textAgentSent  = "Команда ушла агенту: он напишет, когда начнёт прогон, а по итогам пришлёт отчёт."
+	textAgentDown  = "Не получилось передать команду агенту: нет связи с Kafka 😔 Попробуй чуть позже."
+	textRunStarted = "▶️ Агент начал прогон. Когда закончит, пришлю отчёт."
+	textRunBusy    = "⏳ Агент занят другим прогоном и эту команду пропустил. Отчёт о текущем прогоне придёт, когда он закончится."
 )
 
-// menuMessage is the main menu; admins also get the drafts button.
+const textAgent = `🤖 Агент ищет в интернете свежие сведения для разделов бота и присылает черновики карточек на проверку. По расписанию он запускается сам, а здесь его можно запустить сейчас.
+
+Страницы, которые не изменились с прошлого прогона, агент модели не отправляет, поэтому обычный прогон обходится дёшево. «Перечитать всё» отправит модели все страницы заново: это дороже, зато пригодится, если агента настроили по-новому.`
+
+// menuMessage is the main menu; admins also get the drafts and the agent
+// buttons.
 func (b *Bot) menuMessage(userID int64, text string) Message {
 	var kb [][]Button
 	for _, c := range b.survey.Categories {
 		kb = append(kb, []Button{{Text: c.Title, Payload: payload(actCategory, c.ID)}})
 	}
 	if b.isAdmin(userID) {
-		kb = append(kb, []Button{{Text: labelDrafts, Payload: actDrafts}})
+		row := []Button{{Text: labelDrafts, Payload: actDrafts}}
+		if b.agent != nil {
+			row = append(row, Button{Text: labelAgent, Payload: actAgent})
+		}
+		kb = append(kb, row)
 	}
 	kb = append(kb, []Button{
 		{Text: labelProfile, Payload: actProfile},

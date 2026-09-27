@@ -113,20 +113,24 @@ type RunCommand struct {
 // RunTrigger is what started a run.
 type RunTrigger string
 
-// Run triggers.
+// Run triggers. RunTriggerCLI is a run started from the command line, agent
+// collect.
 const (
 	RunTriggerUnknown  RunTrigger = "UNKNOWN"
 	RunTriggerSchedule RunTrigger = "SCHEDULE"
 	RunTriggerCommand  RunTrigger = "COMMAND"
+	RunTriggerCLI      RunTrigger = "CLI"
 )
 
-// RunStatus is how a run ended.
+// RunStatus is where a run is.
 type RunStatus string
 
-// Run statuses. RunStatusBusy means a command came during another run and
-// was skipped.
+// Run statuses. A run reports RunStatusStarted, then RunStatusDone or
+// RunStatusFailed under the same run ID. RunStatusBusy means a command came
+// during another run and was skipped.
 const (
 	RunStatusUnknown RunStatus = "UNKNOWN"
+	RunStatusStarted RunStatus = "STARTED"
 	RunStatusDone    RunStatus = "DONE"
 	RunStatusFailed  RunStatus = "FAILED"
 	RunStatusBusy    RunStatus = "BUSY"
@@ -138,9 +142,10 @@ type RunReport struct {
 	RunID   string     `avro:"run_id"`
 	Trigger RunTrigger `avro:"trigger"`
 	// CommandID is the command that started the run, if any.
-	CommandID    string    `avro:"command_id"`
-	Status       RunStatus `avro:"status"`
-	StartedAt    time.Time `avro:"started_at"`
+	CommandID string    `avro:"command_id"`
+	Status    RunStatus `avro:"status"`
+	StartedAt time.Time `avro:"started_at"`
+	// FinishedAt is zero in a STARTED report.
 	FinishedAt   time.Time `avro:"finished_at"`
 	Queries      int       `avro:"queries"`
 	Unchanged    int       `avro:"unchanged"`

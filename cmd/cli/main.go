@@ -4,9 +4,9 @@
 //	go run ./cmd/cli
 //
 // With a database it also shows the admin screens, e.g. to review the
-// agent's drafts:
+// agent's drafts and to run it through Kafka:
 //
-//	go run ./cmd/cli -db postgres://... -admin -drafts drafts
+//	go run ./cmd/cli -db postgres://... -admin -kafka localhost:9092 -registry http://localhost:8085
 //
 // Type a button number to press it, or any text to send a message.
 package main
@@ -102,19 +102,20 @@ func run(o options) error {
 			return errors.New("-kafka needs -registry or SCHEMA_REGISTRY_URL")
 		}
 		// A consumer group of its own: a bot running alongside gets every
-		// draft too.
+		// draft and report too.
 		busCtx, stopBus := context.WithCancel(ctx)
-		waitBus, err := bus.Start(busCtx, bus.Config{Brokers: strings.Split(o.kafka, ","), RegistryURL: o.registry, Group: "max-benefits-cli"},
-			store, sv, b.NotifyDrafts, slog.New(slog.DiscardHandler))
+		agent, err := bus.Start(busCtx, bus.Config{Brokers: strings.Split(o.kafka, ","), RegistryURL: o.registry, Group: "max-benefits-cli"},
+			store, sv, b, slog.New(slog.DiscardHandler))
 		if err != nil {
 			stopBus()
 			return err
 		}
 		defer func() {
 			stopBus()
-			waitBus()
+			agent.Wait()
 		}()
-		fmt.Println(dim("Kafka подключена: черновики агента придут сами."))
+		b.WithAgent(agent)
+		fmt.Println(dim("Kafka подключена: черновики и отчёты агента придут сами, а кнопка «Агент» запустит его."))
 	}
 
 	fmt.Println(dim("Номер — нажать кнопку, текст — отправить сообщение, пустая строка или Ctrl+D — выход.\n"))

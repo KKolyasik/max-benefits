@@ -1,6 +1,7 @@
 # Production stack on the server. CI uploads this file to DEPLOY_PATH
-# (/opt/max-benefits) and runs it with the .env next to it: BOT_IMAGE and
-# WEBHOOK_URL come from the deploy, the rest is set on the server.
+# (/opt/max-benefits) and runs it with the .env next to it: BOT_IMAGE,
+# AGENT_IMAGE and WEBHOOK_URL come from the deploy, the rest is set on the
+# server.
 # The questionnaire is baked into the image, so a rollback restores it with
 # the code. The cards live in Postgres: the image only fills an empty
 # database, and cards approved by admins survive deploys and rollbacks.
@@ -40,6 +41,33 @@ services:
     stop_grace_period: 30s
     logging: *logging
 
+  # The agent searches the web and drafts cards for the admins: on the
+  # schedule and when an admin presses the button in the bot.
+  agent:
+    image: ${AGENT_IMAGE:?set AGENT_IMAGE to the image to run}
+    restart: unless-stopped
+    # Only its own settings from .env: the agent has no business with the
+    # bot's token. The deploy checks that the Yandex key is there.
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      YANDEX_API_KEY: ${YANDEX_API_KEY:-}
+      YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
+      AGENT_SCHEDULE: ${AGENT_SCHEDULE:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TOKEN_LIMIT: ${LLM_TOKEN_LIMIT:-}
+      YANDEX_ASYNC: ${YANDEX_ASYNC:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    # What the agent read last time: unchanged pages don't go to the model.
+    volumes:
+      - agent-data:/data
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    # Lets a run that is cut short report to the admins.
+    stop_grace_period: 30s
+    logging: *logging
+
   redis:
     image: redis:7.4-alpine
     restart: unless-stopped
@@ -71,7 +99,7 @@ services:
     logging: *logging
 
   # One Kafka broker in KRaft mode, reachable only inside the project's
-  # network: the bot and, later, the agent.
+  # network: the bot and the agent.
   kafka:
     image: apache/kafka:4.3.1
     restart: unless-stopped
@@ -125,3 +153,4 @@ volumes:
   redis-data:
   postgres-data:
   kafka-data:
+  agent-data:

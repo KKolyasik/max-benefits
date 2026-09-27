@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -332,21 +333,129 @@ func TestDraftDecidedByAnotherAdmin(t *testing.T) {
 	}
 }
 
-func TestNotifyDrafts(t *testing.T) {
+// agent records the commands to run.
+type agent struct {
+	mu     sync.Mutex
+	forces []bool
+	err    error
+}
+
+func (a *agent) RunAgent(_ context.Context, force bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.forces = append(a.forces, force)
+	return a.err
+}
+
+func TestAdminRunsTheAgent(t *testing.T) {
+	admin, student, _ := newAdminSetup(t)
+	ag := &agent{}
+	admin.bot.WithAgent(ag)
+
+	student.start()
+	if student.hasButton("Агент") {
+		t.Error("only admins see the agent button")
+	}
+	student.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: actRun, SourceText: "подделка"})
+	if len(ag.forces) != 0 {
+		t.Fatal("a forged press must not run the agent")
+	}
+
+	admin.start()
+	admin.press("Агент")
+	if !strings.Contains(admin.chat.last().Text, "По расписанию он запускается сам") {
+		t.Errorf("the agent screen:\n%s", admin.chat.last().Text)
+	}
+	admin.press("Запустить")
+	if got := admin.chat.last().Text; got != textAgentSent {
+		t.Errorf("after the press: %q", got)
+	}
+	admin.say("/agent")
+	admin.press("Перечитать всё")
+	if !slices.Equal(ag.forces, []bool{false, true}) {
+		t.Errorf("commands %v", ag.forces)
+	}
+}
+
+// Without Kafka the command doesn't reach the agent, and the admin is told.
+func TestAgentUnreachable(t *testing.T) {
+	admin, _, _ := newAdminSetup(t)
+	admin.bot.WithAgent(&agent{err: errors.New("kafka is down")})
+	admin.say("/agent")
+	admin.press("Запустить")
+	if got := admin.chat.last().Text; got != textAgentDown {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestNotifyRun(t *testing.T) {
 	admin, student, kb := newAdminSetup(t)
 	kb.addDraft(grant, "")
+	ctx := context.Background()
+	notify := func(r moderation.Run) Message {
+		t.Helper()
+		n := len(admin.chat.messages)
+		if err := admin.bot.NotifyRun(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		if len(admin.chat.messages) == n {
+			return Message{}
+		}
+		return admin.chat.last()
+	}
 
-	if err := admin.bot.NotifyDrafts(context.Background(), 1); err != nil {
-		t.Fatal(err)
+	// An admin who pressed the button hears that the run started; the
+	// schedule starts runs without a word.
+	if got := notify(moderation.Run{Trigger: moderation.ByCommand, Status: moderation.RunStarted}); got.Text != textRunStarted {
+		t.Errorf("started by the button: %q", got.Text)
 	}
-	if got := admin.chat.last(); !strings.Contains(got.Text, "черновики: 1") || !admin.hasButton("Разобрать") {
-		t.Errorf("notification %+v", got)
+	if got := notify(moderation.Run{Trigger: moderation.BySchedule, Status: moderation.RunStarted}); got.Text != "" {
+		t.Errorf("started by the schedule: %q", got.Text)
 	}
-	if len(student.chat.messages) != 0 {
-		t.Error("students must not be notified")
+	if got := notify(moderation.Run{Trigger: moderation.ByCommand, Status: moderation.RunBusy}); got.Text != textRunBusy {
+		t.Errorf("busy: %q", got.Text)
+	}
+
+	done := notify(moderation.Run{Trigger: moderation.BySchedule, Status: moderation.RunDone, Queries: 13, Unchanged: 9,
+		Failed: 1, Deferred: 2, Drafts: 1, InputTokens: 114_000, OutputTokens: 6_000})
+	for _, want := range []string{"закончил прогон по расписанию", "Запросов: 13, без изменений: 9, с ошибкой: 1.",
+		"кончился лимит токенов: 2", "Черновиков прислал: 1, на проверке всего: 1.", "Токенов модели: 120 000."} {
+		if !strings.Contains(done.Text, want) {
+			t.Errorf("the report has no %q:\n%s", want, done.Text)
+		}
 	}
 	admin.press("Разобрать")
 	if !strings.Contains(admin.chat.last().Text, "Черновик №1") {
 		t.Errorf("the button must open the draft:\n%s", admin.chat.last().Text)
+	}
+
+	failed := notify(moderation.Run{Trigger: moderation.ByCommand, Status: moderation.RunFailed, Error: "search is down"})
+	if !strings.Contains(failed.Text, "Прогон агента по кнопке сорвался.\nПричина: search is down") {
+		t.Errorf("failed:\n%s", failed.Text)
+	}
+	if len(student.chat.messages) != 0 {
+		t.Error("students must not hear about the agent")
+	}
+}
+
+// At night the reports come without a sound.
+func TestNightRunIsSilent(t *testing.T) {
+	admin, _, _ := newAdminSetup(t)
+	for hour, silent := range map[int]bool{3: true, 23: true, 8: false, 15: false} {
+		admin.bot.now = func() time.Time { return time.Date(2026, 9, 28, hour, 0, 0, 0, time.Local) }
+		if err := admin.bot.NotifyRun(context.Background(), moderation.Run{Trigger: moderation.BySchedule, Status: moderation.RunDone}); err != nil {
+			t.Fatal(err)
+		}
+		if got := admin.chat.last().Silent; got != silent {
+			t.Errorf("at %d:00 silent is %v", hour, got)
+		}
+	}
+}
+
+func TestGroupDigits(t *testing.T) {
+	for n, want := range map[int64]string{0: "0", 999: "999", 1000: "1 000", 120_000: "120 000", 1_234_567: "1 234 567"} {
+		if got := groupDigits(n); got != want {
+			t.Errorf("%d: %q", n, got)
+		}
 	}
 }
