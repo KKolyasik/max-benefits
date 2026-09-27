@@ -2,7 +2,9 @@ package contract
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"reflect"
 	"sync"
 
@@ -144,4 +146,15 @@ func (c *Codec) reader(ctx context.Context, typ reflect.Type, s *schema, id int)
 	c.readers[reader{typ, id}] = r
 	c.mu.Unlock()
 	return r, nil
+}
+
+// Temporary tells an error of Decode that passes, as the registry is down
+// or failing, from a message that can never be read.
+func Temporary(err error) bool {
+	var resp *sr.ResponseError
+	if errors.As(err, &resp) {
+		return resp.StatusCode >= 500
+	}
+	var netErr *url.Error
+	return errors.As(err, &netErr)
 }

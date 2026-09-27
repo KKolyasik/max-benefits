@@ -67,7 +67,8 @@ func TestWithPostgres(t *testing.T) {
 	cards := base.Cards()
 	newer := cards[0]
 	newer.Summary = "Проездной подорожал."
-	b.produce(t, "d1", b.draft(t, contract.Draft{ID: "d1", Card: newer.Contract(), Updates: newer.ID, Query: "проездной", FoundAt: at}))
+	b.produce(t, contract.TopicDrafts, "d1",
+		&contract.Draft{ID: "d1", Card: newer.Contract(), Updates: newer.ID, Query: "проездной", FoundAt: at})
 
 	var draftID int64
 	waitFor(t, "the draft waiting for review", func() bool {
@@ -75,9 +76,6 @@ func TestWithPostgres(t *testing.T) {
 		draftID = d.ID
 		return ok && err == nil
 	})
-	if <-b.notified != 1 {
-		t.Error("admins must hear about the draft")
-	}
 	if _, _, err := store.ApproveDraft(ctx, draftID, 7); err != nil {
 		t.Fatal(err)
 	}

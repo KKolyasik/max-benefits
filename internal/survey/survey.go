@@ -76,7 +76,11 @@ func Parse(data []byte) (*Survey, error) {
 	if err := yaml.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
+	return build(f)
+}
 
+// build validates the categories and questions and indexes them.
+func build(f file) (*Survey, error) {
 	s := &Survey{
 		Categories: f.Categories,
 		questions:  make(map[string]*Question, len(f.Questions)),

@@ -30,9 +30,10 @@ type Bot struct {
 	out    Messenger
 	log    *slog.Logger
 	now    func() time.Time
-	// mod and admins are set by WithModeration.
+	// mod and admins are set by WithModeration, agent by WithAgent.
 	mod    Moderation
 	admins map[int64]bool
+	agent  Agent
 }
 
 func New(s *survey.Survey, kb knowledge.Base, store session.Store, out Messenger, log *slog.Logger) *Bot {
@@ -140,6 +141,11 @@ func (b *Bot) onText(ctx context.Context, ev Event, sess *session.Session) (repl
 		if b.isAdmin(ev.UserID) {
 			b.toMenu(sess)
 			return b.nextDraft(ctx, 0)
+		}
+	case "/agent", "агент":
+		if b.isAdmin(ev.UserID) && b.agent != nil {
+			b.toMenu(sess)
+			return reply{messages: []Message{agentMessage()}}, nil
 		}
 	case "/profile", "анкета", "моя анкета":
 		return reply{messages: []Message{b.profileMessage(sess.Answers)}}, nil
@@ -265,7 +271,7 @@ func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (
 		r.answer = freeze(ev, strings.Join(q.Titles(sess.Answers[q.ID]), ", "))
 		return r, err
 
-	case actDrafts, actApprove, actReject, actSkip:
+	case actDrafts, actApprove, actReject, actSkip, actAgent, actRun:
 		return b.onAdmin(ctx, ev, action, arg(0))
 
 	default:

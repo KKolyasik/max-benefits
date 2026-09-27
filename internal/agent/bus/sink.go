@@ -1,21 +1,18 @@
-package agent
+// Package bus is the agent's end of the contract with the bot (see package
+// contract). It reads the base the bot publishes, sends the drafts and the
+// reports of the runs, and serves the agent: runs it on the admins'
+// commands and on a schedule, one run at a time.
+package bus
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
 	"fmt"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/KKolyasik/max-benefits/contract"
-	"github.com/KKolyasik/max-benefits/internal/knowledge"
+	"github.com/KKolyasik/max-benefits/internal/agent"
 )
-
-// ErrSink means drafts can't be delivered: the run stops rather than spend
-// tokens on drafts nobody gets.
-var ErrSink = errors.New("drafts can't be delivered")
 
 // KafkaSink sends drafts to the bot through Kafka.
 type KafkaSink struct {
@@ -29,9 +26,9 @@ type KafkaSink struct {
 
 // Write sends the draft. Every draft is sent: the bot keeps only the newest
 // one of a card for review.
-func (k *KafkaSink) Write(ctx context.Context, d Draft) (string, bool, error) {
+func (k *KafkaSink) Write(ctx context.Context, d agent.Draft) (string, bool, error) {
 	m := contract.Draft{
-		ID: DraftID(d), Card: d.Card.Contract(), Updates: d.Updates, Query: d.Query,
+		ID: agent.DraftID(d), Card: d.Card.Contract(), Updates: d.Updates, Query: d.Query,
 		Sources: d.Sources, Notes: d.Notes, FoundAt: d.FoundAt, RunID: k.RunID,
 	}
 	value, err := k.Codec.Encode(&m)
@@ -39,15 +36,7 @@ func (k *KafkaSink) Write(ctx context.Context, d Draft) (string, bool, error) {
 		return "", false, err
 	}
 	if err := k.Client.ProduceSync(ctx, &kgo.Record{Topic: contract.TopicDrafts, Key: []byte(m.ID), Value: value}).FirstErr(); err != nil {
-		return "", false, fmt.Errorf("%w: send the draft of %s to kafka: %w", ErrSink, d.Card.ID, err)
+		return "", false, fmt.Errorf("%w: send the draft of %s to kafka: %w", agent.ErrSink, d.Card.ID, err)
 	}
 	return contract.TopicDrafts + "/" + m.ID[:12], true, nil
-}
-
-// DraftID derives the ID of a draft from what it proposes: the card and the
-// card it rewrites. So the same proposal sent again is one draft for the
-// bot, and a rejected one stays rejected.
-func DraftID(d Draft) string {
-	sum := sha256.Sum256([]byte(d.Updates + "\n" + knowledge.MarshalCard(d.Card)))
-	return hex.EncodeToString(sum[:])
 }

@@ -34,6 +34,8 @@ type Message struct {
 	// Markdown enables **bold**, _italic_ and [links](https://...).
 	Markdown bool
 	Keyboard [][]Button
+	// Silent delivers the message without a sound.
+	Silent bool
 }
 
 // Button is a callback button when Payload is set and a link button when URL

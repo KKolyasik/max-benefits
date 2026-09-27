@@ -61,7 +61,10 @@ type Collector struct {
 	Fetch   Fetcher
 	Model   Model
 	Drafts  Sink
-	State   *State
+	// Rejected are the IDs (DraftID) of the drafts admins rejected: the same
+	// proposal is not sent again.
+	Rejected map[string]bool
+	State    *State
 	// Force sends pages to the model even if they did not change.
 	Force bool
 	// Parallel is how many queries run at once: the asynchronous mode may
@@ -208,15 +211,20 @@ func (c *Collector) query(ctx context.Context, q Query, r *run, log *slog.Logger
 		urls[i] = s.URL
 	}
 	for _, p := range proposals {
-		r.drafts.Lock()
-		path, written, err := c.Drafts.Write(ctx, Draft{
+		d := Draft{
 			Query:   q.Text,
 			FoundAt: c.now(),
 			Updates: p.Updates,
 			Sources: urls,
 			Notes:   problems[p.Card.ID],
 			Card:    p.Card,
-		})
+		}
+		if c.Rejected[DraftID(d)] {
+			log.Info("admins rejected the same draft before", "card", p.Card.ID)
+			continue
+		}
+		r.drafts.Lock()
+		path, written, err := c.Drafts.Write(ctx, d)
 		r.drafts.Unlock()
 		if err != nil {
 			return err

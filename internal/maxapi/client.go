@@ -92,6 +92,9 @@ func (c *Client) Send(ctx context.Context, userID int64, msg bot.Message) error 
 	if msg.Markdown {
 		m.SetFormat(model.FormatMarkdown)
 	}
+	if msg.Silent {
+		m.WithoutNotify()
+	}
 	m.AddAttachments(attachments(msg.Keyboard))
 	_, err := c.api.Messages.Send(ctx, m)
 	return err

@@ -6,21 +6,22 @@
 #         ├─▶ build ─▶ deploy
 #   test ─┘
 #
-#   lint   — golangci-lint (.golangci.yml), hadolint для Dockerfile, actionlint
-#            для этого файла;
+#   lint   — golangci-lint (.golangci.yml), hadolint для Dockerfile и
+#            Dockerfile.agent, actionlint для этого файла;
 #   test   — go test с -race и покрытием; тесты базы — на Postgres из services,
 #            тест контракта — на Kafka и Schema Registry из docker-compose.yml;
-#   build  — образ linux/amd64 с тегом <sha коммита>; в Docker Hub уходит всё,
-#            кроме пул-реквестов, когда Docker Hub настроен;
+#   build  — образы бота и агента linux/amd64 с тегом <sha коммита>; в Docker
+#            Hub уходит всё, кроме пул-реквестов, когда Docker Hub настроен;
 #   deploy — выкатка на сервер, как manual-джоба в GitLab: окружение production
 #            требует подтверждения, и джоба ждёт кнопку.
 #
 # Настройки — секреты репозитория, см. README, раздел «CI/CD и деплой»:
 # DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, IMAGE, DEPLOY_HOST, DEPLOY_USER,
 # DEPLOY_HOST_FINGERPRINT, DEPLOY_SSH_KEY, WEBHOOK_URL и, если нужно,
-# DEPLOY_PATH. Логи публичного репозитория видны всем, а секреты в них
-# маскируются. Токен бота, пароль Postgres и секрет вебхука хранятся только на
-# сервере, в .env.
+# DEPLOY_PATH. Образ агента называется по образу бота: IMAGE без -bot и с
+# -agent. Логи публичного репозитория видны всем, а секреты в них
+# маскируются. Токен бота, ключ Яндекса, пароль Postgres и секрет вебхука
+# хранятся только на сервере, в .env.
 
 name: pipeline
 
@@ -48,7 +49,7 @@ jobs:
       - name: golangci-lint
         run: docker run --rm -v "$PWD:/app" -w /app golangci/golangci-lint:v2.13.2 golangci-lint run ./...
       - name: hadolint
-        run: docker run --rm -v "$PWD:/app" -w /app hadolint/hadolint:v2.15.1-debian hadolint Dockerfile
+        run: docker run --rm -v "$PWD:/app" -w /app hadolint/hadolint:v2.15.1-debian hadolint Dockerfile Dockerfile.agent
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
@@ -110,16 +111,21 @@ jobs:
       IMAGE: ${{ secrets.IMAGE || 'max-benefits-bot' }}
     steps:
       - uses: actions/checkout@v7
-      - name: deploy set up
+      - name: settings
         id: setup
-        run: echo "deploy=${{ secrets.DEPLOY_HOST != '' }}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "deploy=${{ secrets.DEPLOY_HOST != '' }}" >> "$GITHUB_OUTPUT"
+          # The agent's image is named after the bot's:
+          # kkolyasik/max-benefits-bot and kkolyasik/max-benefits-agent.
+          echo "AGENT_IMAGE=${IMAGE%-bot}-agent" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         if: env.PUSH == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - name: bot image
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -128,6 +134,17 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: agent image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ env.AGENT_IMAGE }}:${{ github.sha }}
+          # A cache of its own, so the two images don't evict each other.
+          cache-from: type=gha,scope=agent
+          cache-to: type=gha,mode=max,scope=agent
 
   deploy:
     needs: build
@@ -143,6 +160,11 @@ jobs:
       DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/max-benefits' }}
     steps:
       - uses: actions/checkout@v7
+      - name: agent image
+        # Named after the bot's image, as in the build.
+        env:
+          IMAGE: ${{ secrets.IMAGE }}
+        run: echo "AGENT_IMAGE=${IMAGE%-bot}-agent" >> "$GITHUB_ENV"
       - name: upload compose file
         uses: appleboy/scp-action@v1
         with:
@@ -159,6 +181,7 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           RELEASE_IMAGE: ${{ secrets.IMAGE }}:${{ github.sha }}
+          RELEASE_AGENT_IMAGE: ${{ env.AGENT_IMAGE }}:${{ github.sha }}
           RELEASE_REF: ${{ github.ref_name }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         with:
@@ -166,13 +189,15 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
-          envs: RELEASE_IMAGE,RELEASE_REF,WEBHOOK_URL,DEPLOY_PATH
+          envs: RELEASE_IMAGE,RELEASE_AGENT_IMAGE,RELEASE_REF,WEBHOOK_URL,DEPLOY_PATH
           script: |
             set -eu
-            if ! printf '%s' "$RELEASE_IMAGE" | grep -Eqx '[a-z0-9._/-]+:[0-9a-f]{40}'; then
-              echo "Bad image '$RELEASE_IMAGE' from CI"
-              exit 1
-            fi
+            for image in "$RELEASE_IMAGE" "$RELEASE_AGENT_IMAGE"; do
+              if ! printf '%s' "$image" | grep -Eqx '[a-z0-9._/-]+:[0-9a-f]{40}'; then
+                echo "Bad image '$image' from CI"
+                exit 1
+              fi
+            done
             case "$WEBHOOK_URL" in
               https://*) ;;
               *) echo "Set the WEBHOOK_URL secret of the repository to the https address of the webhook"; exit 1 ;;
@@ -184,17 +209,26 @@ jobs:
             # for ${BOT_IMAGE} and the like in the file.
             compose="docker compose -p max-benefits -f docker-compose.prod.yml"
             previous=$(sed -n 's/^BOT_IMAGE=//p' .env 2>/dev/null || true)
+            previous_agent=$(sed -n 's/^AGENT_IMAGE=//p' .env 2>/dev/null || true)
             if ! grep -q '^MAX_BOT_TOKEN=.' .env 2>/dev/null; then
               echo "Put MAX_BOT_TOKEN=... into $DEPLOY_PATH/.env on the server"
               exit 1
             fi
-            echo "Deploying $RELEASE_IMAGE from $RELEASE_REF (was: ${previous:-nothing})"
+            for key in YANDEX_API_KEY YANDEX_FOLDER_ID; do
+              if ! grep -q "^$key=." .env; then
+                echo "Put $key=... into $DEPLOY_PATH/.env on the server: the agent searches and drafts cards with it"
+                exit 1
+              fi
+            done
+            echo "Deploying $RELEASE_IMAGE and $RELEASE_AGENT_IMAGE from $RELEASE_REF (was: ${previous:-nothing})"
 
-            # Pull first: a missing image must not touch the running bot.
-            if ! docker pull -q "$RELEASE_IMAGE"; then
-              echo "Image $RELEASE_IMAGE not found: the build job pushes images only for main and manual runs."
-              exit 1
-            fi
+            # Pull first: a missing image must not touch the running services.
+            for image in "$RELEASE_IMAGE" "$RELEASE_AGENT_IMAGE"; do
+              if ! docker pull -q "$image"; then
+                echo "Image $image not found: the build job pushes images only for main and manual runs."
+                exit 1
+              fi
+            done
 
             umask 077
             # Postgres takes its password on the first start, and the compose
@@ -207,38 +241,52 @@ jobs:
             printf 'WEBHOOK_URL=%s\n' "$WEBHOOK_URL" >> .env.next
             mv .env.next .env
             cp .env .env.previous
-            # Only the image tag changes: the token, the secrets and any
+            # Only the image tags change: the token, the secrets and any
             # settings added on the server by hand are kept.
-            grep -v '^BOT_IMAGE=' .env.previous > .env
-            printf 'BOT_IMAGE=%s\n' "$RELEASE_IMAGE" >> .env
+            grep -v -e '^BOT_IMAGE=' -e '^AGENT_IMAGE=' .env.previous > .env
+            printf 'BOT_IMAGE=%s\nAGENT_IMAGE=%s\n' "$RELEASE_IMAGE" "$RELEASE_AGENT_IMAGE" >> .env
             # MAX sends this secret with every webhook request, and the bot
             # registers it in MAX itself, so any random value will do.
             if ! grep -q '^WEBHOOK_SECRET=.' .env; then
               printf 'WEBHOOK_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env
             fi
             since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            $compose up -d --remove-orphans --force-recreate bot
+            $compose up -d --remove-orphans --force-recreate bot agent
 
+            # Keeps only the current and the previous image of a repository,
+            # for rollbacks.
+            prune() {
+              docker images "${1%:*}" --format '{{.Repository}}:{{.Tag}}' \
+                | grep -vx -e "$1" -e "${2:-none}" \
+                | xargs -r docker image rm > /dev/null || true
+            }
             # The bot logs "bot is running" once it reached Redis, Postgres
-            # and MAX.
+            # and MAX, the agent "agent is running" once it reached Kafka.
             for i in $(seq 30); do
-              if $compose logs --since "$since" bot | grep -q '"bot is running"'; then
-                echo "$RELEASE_IMAGE from $RELEASE_REF, deployed $(date -u +%FT%TZ)" > VERSION
-                # Keep only the current and the previous image for rollbacks.
-                docker images "${RELEASE_IMAGE%:*}" --format '{{.Repository}}:{{.Tag}}' \
-                  | grep -vx -e "$RELEASE_IMAGE" -e "${previous:-none}" \
-                  | xargs -r docker image rm > /dev/null || true
-                echo "Deployed $RELEASE_IMAGE after $((i * 2)) s"
+              if $compose logs --since "$since" bot | grep -q '"bot is running"' &&
+                $compose logs --since "$since" agent | grep -q '"agent is running"'; then
+                echo "$RELEASE_IMAGE and $RELEASE_AGENT_IMAGE from $RELEASE_REF, deployed $(date -u +%FT%TZ)" > VERSION
+                prune "$RELEASE_IMAGE" "$previous"
+                prune "$RELEASE_AGENT_IMAGE" "$previous_agent"
+                echo "Deployed $RELEASE_IMAGE and $RELEASE_AGENT_IMAGE after $((i * 2)) s"
                 exit 0
               fi
               sleep 2
             done
 
-            echo "The bot did not start, last logs:"
-            $compose logs --since "$since" --tail 30 bot
+            echo "The bot or the agent did not start, last logs:"
+            $compose logs --since "$since" --tail 30 bot agent
             if [ -n "$previous" ]; then
               echo "Rolling back to $previous"
               mv .env.previous .env
-              $compose up -d --force-recreate bot
+              if [ -n "$previous_agent" ]; then
+                $compose up -d --force-recreate bot agent
+              else
+                # The agent came with this release. The compose file still
+                # names its image, so the name stays, and the agent goes.
+                printf 'AGENT_IMAGE=%s\n' "$RELEASE_AGENT_IMAGE" >> .env
+                $compose rm -sf agent
+                $compose up -d --force-recreate bot
+              fi
             fi
             exit 1

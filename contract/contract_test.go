@@ -52,6 +52,8 @@ func TestRoundTrip(t *testing.T) {
 		&RunReport{RunID: "r1", Trigger: RunTriggerCommand, CommandID: "c1", Status: RunStatusDone,
 			StartedAt: at, FinishedAt: at.Add(time.Minute), Queries: 13, Unchanged: 4, Failed: 1, Deferred: 2,
 			Drafts: 5, InputTokens: 150_000, OutputTokens: 7_000, Error: "что-то"},
+		// A run that goes on has no finish.
+		&RunReport{RunID: "r2", Trigger: RunTriggerCLI, Status: RunStatusStarted, StartedAt: at},
 	}
 	for _, m := range messages {
 		data, err := c.Encode(m)
@@ -149,7 +151,11 @@ func TestOlderVersionReadsWithDefaults(t *testing.T) {
 // too: the field is skipped, the status is UNKNOWN.
 func TestNewerVersionReads(t *testing.T) {
 	r, c := registered(t)
-	newer := strings.Replace(schemas[reflect.TypeFor[RunReport]()].json, `"BUSY"]`, `"BUSY","CANCELLED"]`, 1)
+	current := schemas[reflect.TypeFor[RunReport]()].json
+	newer := strings.Replace(current, `"STARTED"]`, `"STARTED","CANCELLED"]`, 1)
+	if newer == current {
+		t.Fatal("the statuses are not where the test expects them")
+	}
 	newer = strings.Replace(newer, `{"default":"","doc":"Why the run failed.","name":"error","type":"string"}`,
 		`{"default":"","doc":"Why the run failed.","name":"error","type":"string"},{"default":0,"name":"cost","type":"double"}`, 1)
 	type newerReport struct {

@@ -1,21 +1,27 @@
 // Command agent keeps the knowledge base fresh: it searches the web by the
 // queries from data/queries.yaml, reads the found pages and asks a language
-// model to draft cards. The drafts go to the bot through Kafka, or into
-// drafts/ when Kafka is not set up:
+// model to draft cards. Admins review every draft in the bot before it
+// reaches the students.
+//
+// As a service it runs on a schedule and when an admin presses the button in
+// the bot, and tells the admins how each run went; it talks to the bot
+// through Kafka:
+//
+//	go run ./cmd/agent serve
+//
+// It can also run once from the command line. Without Kafka the drafts go
+// into drafts/, and the base comes from data/ instead of the bot:
 //
 //	go run ./cmd/agent collect
 //
-// Admins review every draft in the bot before it reaches the students.
 // Settings come from environment variables or a .env file, see README.
 package main
 
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,12 +35,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/KKolyasik/max-benefits/contract"
 	"github.com/KKolyasik/max-benefits/internal/agent"
+	"github.com/KKolyasik/max-benefits/internal/agent/bus"
 	"github.com/KKolyasik/max-benefits/internal/agent/fetch"
 	"github.com/KKolyasik/max-benefits/internal/agent/llm"
 	"github.com/KKolyasik/max-benefits/internal/agent/search"
@@ -50,8 +58,14 @@ const yandexLLMURL = "https://ai.api.cloud.yandex.net/v1"
 // 5.1 in the asynchronous mode.
 const defaultTokenLimit = 300_000
 
+// defaultSchedule runs the agent on Mondays at 3 a.m.: sites change with the
+// academic calendar, not daily, admins review a week's drafts at once, and
+// the search costs less at night.
+const defaultSchedule = "0 3 * * 1"
+
 const usage = `usage:
-  agent collect [-force]   search, read pages and draft cards`
+  agent serve              run on the schedule and on the admins' command (needs Kafka)
+  agent collect [-force]   run once: search, read pages and draft cards`
 
 type config struct {
 	SurveyFile    string
@@ -75,14 +89,20 @@ type config struct {
 	YandexAsync bool
 	// TokenLimit caps the model tokens of a run; 0 means no limit.
 	TokenLimit int
-	// KafkaBrokers and SchemaRegistryURL send drafts to the bot; without
-	// them drafts go into DraftsDir.
+	// KafkaBrokers and SchemaRegistryURL connect the agent to the bot: the
+	// base comes from it, the drafts and the reports go to it. Without them
+	// the base comes from the files, and the drafts go into DraftsDir.
 	KafkaBrokers      []string
 	SchemaRegistryURL string
+	// Schedule is when the service runs by itself, in cron syntax and local
+	// time; nil means only on the admins' command.
+	Schedule     cron.Schedule
+	ScheduleSpec string
 	// CAFile is an extra root certificate for reading sites: many Russian
 	// official sites use the Russian Trusted Root CA.
 	CAFile   string
 	LogLevel slog.Level
+	LogJSON  bool
 }
 
 func main() {
@@ -114,89 +134,48 @@ func run(args []string) error {
 			return err
 		}
 		return collect(ctx, cfg, *force)
+	case "serve":
+		return serve(ctx, cfg)
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
 	}
 }
 
+// serve runs the agent as a service until it is stopped.
+func serve(ctx context.Context, cfg config) error {
+	if len(cfg.KafkaBrokers) == 0 {
+		return errors.New("the service takes the admins' commands and the base through Kafka: set KAFKA_BROKERS and SCHEMA_REGISTRY_URL")
+	}
+	a, err := newApp(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	a.log.Info("serving", "schedule", cfg.ScheduleSpec)
+	return bus.Serve(ctx, bus.Config{Brokers: cfg.KafkaBrokers, Group: "max-benefits-agent", Schedule: cfg.Schedule}, a.runner(), a.log)
+}
+
+// collect runs the agent once. With Kafka the run is like one from the
+// bot: the base comes from the bot, and the admins get the drafts and the
+// report.
 func collect(ctx context.Context, cfg config, force bool) error {
-	if err := cfg.checkCollect(); err != nil {
-		return err
-	}
-	log := newLogger(cfg)
-	sv, base, err := loadBase(cfg)
+	a, err := newApp(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	queries, err := agent.LoadQueries(cfg.QueriesFile, sv)
-	if err != nil {
-		return err
+	defer a.close()
+	var report agent.Report
+	if a.kafka != nil {
+		report, err = a.runner().Do(ctx, contract.RunTriggerCLI, "", force)
+	} else {
+		report, err = a.run(ctx, "", force)
 	}
-	state, err := agent.LoadState(cfg.StateFile)
-	if err != nil {
-		return err
-	}
-
-	roots, err := certPool(cfg.CAFile)
-	if err != nil {
-		return err
-	}
-	// Found sites often send incomplete certificate chains; APIs don't.
-	web := fetch.NewClient(roots, 30*time.Second)
-	api := apiClient(roots, 30*time.Second)
-	// A local model may think for minutes over a long prompt.
-	modelHTTP := apiClient(roots, 10*time.Minute)
-	var searcher agent.Searcher = &search.SearXNG{URL: cfg.SearXNGURL, HTTP: api}
-	if cfg.SearchProvider == "yandex" {
-		searcher = &search.Yandex{APIKey: cfg.YandexAPIKey, FolderID: cfg.YandexFolderID, Region: cfg.YandexRegion, HTTP: api}
-	}
-	pdftotext, err := exec.LookPath("pdftotext")
-	if err != nil {
-		log.Warn("pdftotext is not installed: PDF documents are read only by their search snippets (install poppler-utils)")
-	}
-
-	// A local model takes one request at a time. In the asynchronous mode a
-	// request waits in a queue for seconds or hours, so queries wait side by
-	// side.
-	var model agent.Model = &llm.Client{
-		BaseURL: cfg.LLMBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.LLMModel, Project: cfg.LLMProject, HTTP: modelHTTP,
-	}
-	parallel, mode := 1, cfg.LLMBaseURL
-	if cfg.YandexAsync {
-		model = &llm.Async{APIKey: cfg.LLMAPIKey, Folder: cfg.LLMProject, Model: cfg.LLMModel, HTTP: api}
-		parallel, mode = 8, "yandex async"
-	}
-
-	// Before anything costs money: without Kafka the drafts would be lost.
-	sink, closeSink, err := openSink(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer closeSink()
-
-	log.Info("collecting", "queries", len(queries), "search", cfg.SearchProvider, "model", cfg.LLMModel, "mode", mode,
-		"token_limit", cfg.TokenLimit, "kafka", len(cfg.KafkaBrokers) > 0)
-	c := &agent.Collector{
-		Survey:     sv,
-		Base:       base,
-		Queries:    queries,
-		Search:     searcher,
-		Fetch:      &fetch.Fetcher{HTTP: web, MaxChars: 5000, PDFToText: pdftotext},
-		Model:      model,
-		Drafts:     sink,
-		State:      state,
-		Force:      force,
-		Parallel:   parallel,
-		TokenLimit: cfg.TokenLimit,
-		Log:        log,
-	}
-	report, err := c.Run(ctx)
 	fmt.Printf("\nЗапросов: %d, без изменений: %d, с ошибкой: %d, отложено: %d, новых черновиков: %d.\n",
 		report.Queries, report.Unchanged, report.Failed, report.Deferred, len(report.Drafts))
 	fmt.Printf("Токены модели: %d на входе, %d на выходе.\n", report.InputTokens, report.OutputTokens)
 	switch {
 	case len(report.Drafts) == 0:
-	case len(cfg.KafkaBrokers) > 0:
+	case a.kafka != nil:
 		fmt.Println("Черновики ушли боту через Kafka: админы увидят их в чате.")
 	default:
 		fmt.Println("Черновики лежат в " + cfg.DraftsDir + ": без Kafka бот их не увидит.")
@@ -212,6 +191,133 @@ func collect(ctx context.Context, cfg config, force bool) error {
 			cfg.TokenLimit, report.Deferred)
 	}
 	return nil
+}
+
+// app is what the runs of the agent share.
+type app struct {
+	cfg      config
+	log      *slog.Logger
+	state    *agent.State
+	search   agent.Searcher
+	fetch    agent.Fetcher
+	model    agent.Model
+	parallel int
+	// kafka and codec are set with Kafka: the base comes from the bot, and
+	// the drafts and the reports go to it.
+	kafka *kgo.Client
+	codec *contract.Codec
+}
+
+// newApp checks the settings and sets up the search, the model and Kafka.
+// A broken Kafka fails here, before a run costs anything.
+func newApp(ctx context.Context, cfg config) (*app, error) {
+	if err := cfg.checkCollect(); err != nil {
+		return nil, err
+	}
+	a := &app{cfg: cfg, log: newLogger(cfg)}
+	var err error
+	if a.state, err = agent.LoadState(cfg.StateFile); err != nil {
+		return nil, err
+	}
+	roots, err := certPool(cfg.CAFile)
+	if err != nil {
+		return nil, err
+	}
+	// Found sites often send incomplete certificate chains; APIs don't.
+	web := fetch.NewClient(roots, 30*time.Second)
+	api := apiClient(roots, 30*time.Second)
+	// A local model may think for minutes over a long prompt.
+	modelHTTP := apiClient(roots, 10*time.Minute)
+	a.search = &search.SearXNG{URL: cfg.SearXNGURL, HTTP: api}
+	if cfg.SearchProvider == "yandex" {
+		a.search = &search.Yandex{APIKey: cfg.YandexAPIKey, FolderID: cfg.YandexFolderID, Region: cfg.YandexRegion, HTTP: api}
+	}
+	pdftotext, err := exec.LookPath("pdftotext")
+	if err != nil {
+		a.log.Warn("pdftotext is not installed: PDF documents are read only by their search snippets (install poppler-utils)")
+	}
+	a.fetch = &fetch.Fetcher{HTTP: web, MaxChars: 5000, PDFToText: pdftotext}
+
+	// A local model takes one request at a time. In the asynchronous mode a
+	// request waits in a queue for seconds or hours, so queries wait side by
+	// side.
+	a.model = &llm.Client{
+		BaseURL: cfg.LLMBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.LLMModel, Project: cfg.LLMProject, HTTP: modelHTTP,
+	}
+	a.parallel = 1
+	mode := cfg.LLMBaseURL
+	if cfg.YandexAsync {
+		a.model = &llm.Async{APIKey: cfg.LLMAPIKey, Folder: cfg.LLMProject, Model: cfg.LLMModel, HTTP: api}
+		a.parallel, mode = 8, "yandex async"
+	}
+
+	if len(cfg.KafkaBrokers) > 0 {
+		if a.kafka, a.codec, err = connect(ctx, cfg); err != nil {
+			return nil, err
+		}
+	}
+	a.log.Info("agent settings", "search", cfg.SearchProvider, "model", cfg.LLMModel, "mode", mode,
+		"token_limit", cfg.TokenLimit, "kafka", a.kafka != nil)
+	return a, nil
+}
+
+func (a *app) close() {
+	if a.kafka != nil {
+		a.kafka.Close()
+	}
+}
+
+// runner runs the agent with reports to the bot; it needs Kafka.
+func (a *app) runner() *bus.Runner {
+	return &bus.Runner{Kafka: a.kafka, Codec: a.codec, Run: a.run, Log: a.log}
+}
+
+// run does one run: it reads the base and the queries anew, so a run sees
+// the cards admins approved since the last one.
+func (a *app) run(ctx context.Context, runID string, force bool) (agent.Report, error) {
+	base, err := a.base(ctx)
+	if err != nil {
+		return agent.Report{}, err
+	}
+	queries, err := agent.LoadQueries(a.cfg.QueriesFile, base.Survey)
+	if err != nil {
+		return agent.Report{}, err
+	}
+	var sink agent.Sink = agent.Drafts{Dir: a.cfg.DraftsDir}
+	log := a.log
+	if a.kafka != nil {
+		sink = &bus.KafkaSink{Client: a.kafka, Codec: a.codec, RunID: runID}
+		log = log.With("run", runID)
+	}
+	log.Info("collecting", "queries", len(queries), "cards", len(base.Cards), "force", force)
+	c := &agent.Collector{
+		Survey:     base.Survey,
+		Base:       base.Cards,
+		Rejected:   base.Rejected,
+		Queries:    queries,
+		Search:     a.search,
+		Fetch:      a.fetch,
+		Model:      a.model,
+		Drafts:     sink,
+		State:      a.state,
+		Force:      force,
+		Parallel:   a.parallel,
+		TokenLimit: a.cfg.TokenLimit,
+		Log:        log,
+	}
+	return c.Run(ctx)
+}
+
+// base reads the survey and the cards: from the bot through Kafka, or from
+// the files without it.
+func (a *app) base(ctx context.Context) (bus.Base, error) {
+	if a.kafka == nil {
+		sv, cards, err := loadBase(a.cfg)
+		return bus.Base{Survey: sv, Cards: cards}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return bus.ReadBase(ctx, a.cfg.KafkaBrokers, a.codec)
 }
 
 // loadBase reads the survey and the cards in file order, and fails if the
@@ -284,11 +390,26 @@ func loadConfig() (config, error) {
 	if (len(cfg.KafkaBrokers) > 0) != (cfg.SchemaRegistryURL != "") {
 		return cfg, errors.New("KAFKA_BROKERS and SCHEMA_REGISTRY_URL go together: set both or neither")
 	}
+	if cfg.ScheduleSpec = env("AGENT_SCHEDULE", defaultSchedule); !strings.EqualFold(cfg.ScheduleSpec, "off") {
+		spec, err := cron.ParseStandard(cfg.ScheduleSpec)
+		if err != nil {
+			return cfg, fmt.Errorf("AGENT_SCHEDULE must be in cron syntax, e.g. %q, or off: %w", defaultSchedule, err)
+		}
+		cfg.Schedule = localTime{spec}
+	}
 	if err := cfg.LogLevel.UnmarshalText([]byte(env("LOG_LEVEL", "info"))); err != nil {
 		return cfg, fmt.Errorf("LOG_LEVEL: %w", err)
 	}
+	cfg.LogJSON = strings.EqualFold(os.Getenv("LOG_FORMAT"), "json")
 	return cfg, nil
 }
+
+// localTime reads a cron schedule in local time. By itself cron reads a
+// schedule without CRON_TZ in the time zone of the moment it is asked
+// about, and the start of the latest run comes from Kafka in UTC.
+type localTime struct{ cron.Schedule }
+
+func (s localTime) Next(t time.Time) time.Time { return s.Schedule.Next(t.In(time.Local)) }
 
 func (cfg config) checkCollect() error {
 	var errs []error
@@ -375,6 +496,9 @@ func env(key, fallback string) string {
 }
 
 func newLogger(cfg config) *slog.Logger {
+	if cfg.LogJSON {
+		return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: cfg.LogLevel,
 		// Timestamps only clutter an interactive run; docker adds its own.
@@ -387,13 +511,8 @@ func newLogger(cfg config) *slog.Logger {
 	}))
 }
 
-// openSink sends drafts to the bot through Kafka: it makes sure the topics
-// and the schemas are there, so a broken Kafka stops the run before it
-// costs anything. Without Kafka the drafts go into files.
-func openSink(ctx context.Context, cfg config) (agent.Sink, func(), error) {
-	if len(cfg.KafkaBrokers) == 0 {
-		return agent.Drafts{Dir: cfg.DraftsDir}, func() {}, nil
-	}
+// connect makes sure the topics and the schemas are there.
+func connect(ctx context.Context, cfg config) (*kgo.Client, *contract.Codec, error) {
 	// Without a delivery timeout a draft would wait for a dead Kafka forever.
 	cl, err := kgo.NewClient(kgo.SeedBrokers(cfg.KafkaBrokers...), kgo.RecordDeliveryTimeout(30*time.Second))
 	if err != nil {
@@ -415,14 +534,7 @@ func openSink(ctx context.Context, cfg config) (agent.Sink, func(), error) {
 		cl.Close()
 		return nil, nil, fmt.Errorf("schema registry: %w", err)
 	}
-	return &agent.KafkaSink{Client: cl, Codec: codec, RunID: runID()}, cl.Close, nil
-}
-
-// runID names a run by its start and a few random bytes.
-func runID() string {
-	b := make([]byte, 3)
-	_, _ = rand.Read(b)
-	return time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b)
+	return cl, codec, nil
 }
 
 // splitList splits a comma-separated list, dropping the blanks.

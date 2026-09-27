@@ -22,6 +22,8 @@ const (
 	actApprove = "adm_ok"   // adm_ok:<draft>
 	actReject  = "adm_no"   // adm_no:<draft>
 	actSkip    = "adm_skip" // adm_skip:<draft>, shows the next one
+	actAgent   = "adm_agent"
+	actRun     = "adm_run" // adm_run[:force] runs the agent
 )
 
 func payload(action string, args ...string) string {

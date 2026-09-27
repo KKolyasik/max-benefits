@@ -105,16 +105,7 @@ func TestThroughKafka(t *testing.T) {
 
 	// The registry refuses a version that old readers could not read: here
 	// the query field, which has no default, is gone.
-	subject := prefix + "maxbenefits.Draft"
-	t.Cleanup(func() {
-		_, _ = reg.DeleteSubject(context.Background(), subject, sr.SoftDelete)
-		_, _ = reg.DeleteSubject(context.Background(), subject, sr.HardDelete)
-	})
-	for _, res := range reg.SetCompatibility(ctx, sr.SetCompatibility{Level: sr.CompatFullTransitive}, subject) {
-		if res.Err != nil {
-			t.Fatal(res.Err)
-		}
-	}
+	subject := testSubject(ctx, t, reg, prefix+"maxbenefits.Draft")
 	current := schemas[reflect.TypeFor[Draft]()].json
 	if _, err := reg.RegisterSchema(ctx, subject, sr.Schema{Schema: current}, -1, -1); err != nil {
 		t.Fatal(err)
@@ -126,4 +117,33 @@ func TestThroughKafka(t *testing.T) {
 	if _, err := reg.RegisterSchema(ctx, subject, sr.Schema{Schema: broken}, -1, -1); err == nil {
 		t.Error("the registry took a schema without a required field")
 	}
+
+	// A new enum symbol is fine: the registry takes the report with STARTED
+	// and CLI after the version without them.
+	subject = testSubject(ctx, t, reg, prefix+"maxbenefits.RunReport")
+	current = schemas[reflect.TypeFor[RunReport]()].json
+	previous := strings.NewReplacer(`,"CLI"`, "", `,"STARTED"`, "").Replace(current)
+	if previous == current {
+		t.Fatal("the symbols are not where the test expects them")
+	}
+	for _, s := range []string{previous, current} {
+		if _, err := reg.RegisterSchema(ctx, subject, sr.Schema{Schema: s}, -1, -1); err != nil {
+			t.Errorf("a new enum symbol must be compatible: %v", err)
+		}
+	}
+}
+
+// testSubject makes a FULL_TRANSITIVE subject that is gone after the test.
+func testSubject(ctx context.Context, t *testing.T, reg *sr.Client, subject string) string {
+	t.Helper()
+	t.Cleanup(func() {
+		_, _ = reg.DeleteSubject(context.Background(), subject, sr.SoftDelete)
+		_, _ = reg.DeleteSubject(context.Background(), subject, sr.HardDelete)
+	})
+	for _, res := range reg.SetCompatibility(ctx, sr.SetCompatibility{Level: sr.CompatFullTransitive}, subject) {
+		if res.Err != nil {
+			t.Fatal(res.Err)
+		}
+	}
+	return subject
 }

@@ -135,19 +135,20 @@ func run() error {
 		if len(cfg.KafkaBrokers) > 0 {
 			// Stopped before the database closes: the bus works with it.
 			busCtx, stopBus := context.WithCancel(ctx)
-			waitBus, err := bus.Start(busCtx,
+			agent, err := bus.Start(busCtx,
 				bus.Config{Brokers: cfg.KafkaBrokers, RegistryURL: cfg.SchemaRegistryURL, Group: "max-benefits-bot"},
-				cards, sv, b.NotifyDrafts, log)
+				cards, sv, b, log)
 			if err != nil {
 				stopBus()
 				return err
 			}
 			defer func() {
 				stopBus()
-				waitBus()
+				agent.Wait()
 			}()
+			b.WithAgent(agent)
 		} else {
-			log.Warn("KAFKA_BROKERS is not set: the agent's drafts don't come, and the agent doesn't learn the cards")
+			log.Warn("KAFKA_BROKERS is not set: the agent's drafts don't come, and admins can't run it")
 		}
 	}
 	pool := dispatch.New(cfg.Workers, 64,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -148,10 +149,20 @@ func (s *fakeStore) draft(id string) (moderation.Draft, bool) {
 }
 
 type bench struct {
-	brokers  []string
-	codec    *contract.Codec
-	notified chan int
-	survey   *survey.Survey
+	brokers []string
+	codec   *contract.Codec
+	// runs are the runs the admins heard about.
+	runs   admins
+	survey *survey.Survey
+	bus    *Bus
+}
+
+// admins records the runs they hear about.
+type admins chan moderation.Run
+
+func (a admins) NotifyRun(_ context.Context, r moderation.Run) error {
+	a <- r
+	return nil
 }
 
 // start runs the bus over a Kafka in memory and a fake registry until the
@@ -168,10 +179,9 @@ func start(t *testing.T, store Store) *bench {
 		t.Fatal(err)
 	}
 	reg := contracttest.NewRegistry(t)
-	b := &bench{brokers: cluster.ListenAddrs(), notified: make(chan int, 100), survey: sv, codec: contract.NewCodec(reg.Client())}
+	b := &bench{brokers: cluster.ListenAddrs(), runs: make(admins, 100), survey: sv, codec: contract.NewCodec(reg.Client())}
 	ctx, cancel := context.WithCancel(context.Background())
-	notify := func(_ context.Context, n int) error { b.notified <- n; return nil }
-	wait, err := Start(ctx, Config{Brokers: b.brokers, RegistryURL: reg.URL(), Group: "bot"}, store, sv, notify,
+	b.bus, err = Start(ctx, Config{Brokers: b.brokers, RegistryURL: reg.URL(), Group: "bot"}, store, sv, b.runs,
 		slog.New(slog.DiscardHandler))
 	if err != nil {
 		cancel()
@@ -179,7 +189,7 @@ func start(t *testing.T, store Store) *bench {
 	}
 	t.Cleanup(func() {
 		cancel()
-		wait()
+		b.bus.Wait()
 	})
 	if err := b.codec.Register(ctx); err != nil {
 		t.Fatal(err)
@@ -208,25 +218,25 @@ func (b *bench) read(t *testing.T, topic string, n int) []*kgo.Record {
 	return out
 }
 
-func (b *bench) produce(t *testing.T, key string, value []byte) {
+// produce sends a record as the agent does: v is a message of the contract
+// or raw bytes.
+func (b *bench) produce(t *testing.T, topic, key string, v any) {
 	t.Helper()
+	value, ok := v.([]byte)
+	if !ok {
+		var err error
+		if value, err = b.codec.Encode(v); err != nil {
+			t.Fatal(err)
+		}
+	}
 	cl, err := kgo.NewClient(kgo.SeedBrokers(b.brokers...))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
-	if err := cl.ProduceSync(context.Background(), &kgo.Record{Topic: contract.TopicDrafts, Key: []byte(key), Value: value}).FirstErr(); err != nil {
+	if err := cl.ProduceSync(context.Background(), &kgo.Record{Topic: topic, Key: []byte(key), Value: value}).FirstErr(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func (b *bench) draft(t *testing.T, d contract.Draft) []byte {
-	t.Helper()
-	data, err := b.codec.Encode(&d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
 }
 
 // waitFor waits until cond holds.
@@ -308,13 +318,13 @@ func TestOutboxGoesToKafka(t *testing.T) {
 func TestDraftsGoToTheStore(t *testing.T) {
 	store := newStore(pass)
 	b := start(t, store)
-	d1 := contract.Draft{ID: "d1", Card: pass.Contract(), Updates: "pass", Query: "проездной",
+	d1 := &contract.Draft{ID: "d1", Card: pass.Contract(), Updates: "pass", Query: "проездной",
 		Sources: []string{"https://metro.spb.ru"}, FoundAt: at}
-	d2 := contract.Draft{ID: "d2", Card: museum.Contract(), Query: "музеи", FoundAt: at}
-	b.produce(t, "d1", b.draft(t, d1))
-	b.produce(t, "junk", []byte("not a draft"))
-	b.produce(t, "d1", b.draft(t, d1))
-	b.produce(t, "d2", b.draft(t, d2))
+	d2 := &contract.Draft{ID: "d2", Card: museum.Contract(), Query: "музеи", FoundAt: at}
+	b.produce(t, contract.TopicDrafts, "d1", d1)
+	b.produce(t, contract.TopicDrafts, "junk", []byte("not a draft"))
+	b.produce(t, contract.TopicDrafts, "d1", d1)
+	b.produce(t, contract.TopicDrafts, "d2", d2)
 
 	waitFor(t, "both drafts", func() bool {
 		_, ok := store.draft("d2")
@@ -324,15 +334,6 @@ func TestDraftsGoToTheStore(t *testing.T) {
 	if got.Card.Title != pass.Title || got.Updates != "pass" || got.Sources[0] != "https://metro.spb.ru" || !got.FoundAt.Equal(at) {
 		t.Errorf("draft %+v", got)
 	}
-	total := 0
-	waitFor(t, "the admins told about 2 drafts", func() bool {
-		select {
-		case n := <-b.notified:
-			total += n
-		default:
-		}
-		return total == 2
-	})
 }
 
 // A database that is down for a while doesn't lose a draft.
@@ -340,13 +341,54 @@ func TestStoreFailureIsRetried(t *testing.T) {
 	store := newStore(pass)
 	store.failAdds = 2
 	b := start(t, store)
-	b.produce(t, "d1", b.draft(t, contract.Draft{ID: "d1", Card: pass.Contract(), Query: "проездной", FoundAt: at}))
+	b.produce(t, contract.TopicDrafts, "d1", &contract.Draft{ID: "d1", Card: pass.Contract(), Query: "проездной", FoundAt: at})
 	waitFor(t, "the draft", func() bool {
 		_, ok := store.draft("d1")
 		return ok
 	})
-	if n := <-b.notified; n != 1 {
-		t.Errorf("notified about %d drafts", n)
+}
+
+// The admins hear how the agent's runs go, but not about runs long past,
+// which a new consumer group would read.
+func TestRunsReachTheAdmins(t *testing.T) {
+	b := start(t, newStore(pass))
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	old := now.Add(-48 * time.Hour)
+	b.produce(t, contract.TopicRuns, "r0", &contract.RunReport{RunID: "r0", Trigger: contract.RunTriggerSchedule,
+		Status: contract.RunStatusDone, StartedAt: old, FinishedAt: old})
+	b.produce(t, contract.TopicRuns, "junk", []byte("not a report"))
+	b.produce(t, contract.TopicRuns, "r1", &contract.RunReport{RunID: "r1", Trigger: contract.RunTriggerCommand,
+		CommandID: "c1", Status: contract.RunStatusStarted, StartedAt: now})
+	b.produce(t, contract.TopicRuns, "r1", &contract.RunReport{RunID: "r1", Trigger: contract.RunTriggerCommand,
+		CommandID: "c1", Status: contract.RunStatusDone, StartedAt: now, FinishedAt: now.Add(time.Minute),
+		Queries: 13, Unchanged: 9, Failed: 1, Deferred: 2, Drafts: 3, InputTokens: 100, OutputTokens: 10})
+
+	started := <-b.runs
+	if started.ID != "r1" || started.Status != moderation.RunStarted || started.Trigger != moderation.ByCommand ||
+		!started.StartedAt.Equal(now) {
+		t.Errorf("started %+v", started)
+	}
+	want := moderation.Run{ID: "r1", Trigger: moderation.ByCommand, Status: moderation.RunDone, StartedAt: now,
+		FinishedAt: now.Add(time.Minute), Queries: 13, Unchanged: 9, Failed: 1, Deferred: 2, Drafts: 3,
+		InputTokens: 100, OutputTokens: 10}
+	if done := <-b.runs; !reflect.DeepEqual(done, want) {
+		t.Errorf("done %+v", done)
+	}
+}
+
+// The button reaches the agent as a command.
+func TestRunAgent(t *testing.T) {
+	b := start(t, newStore(pass))
+	if err := b.bus.RunAgent(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	rec := b.read(t, contract.TopicCommands, 1)[0]
+	var cmd contract.RunCommand
+	if err := b.codec.Decode(context.Background(), rec.Value, &cmd); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.ID == "" || string(rec.Key) != cmd.ID || !cmd.Force || time.Since(cmd.RequestedAt) > time.Minute {
+		t.Errorf("command %q %+v", rec.Key, cmd)
 	}
 }
 
@@ -359,7 +401,7 @@ func TestStartFailsWithoutRegistry(t *testing.T) {
 	defer cluster.Close()
 	sv, _ := survey.Load("../../data/survey.yaml")
 	_, err = Start(context.Background(), Config{Brokers: cluster.ListenAddrs(), RegistryURL: "http://127.0.0.1:1", Group: "bot"},
-		newStore(), sv, func(context.Context, int) error { return nil }, slog.New(slog.DiscardHandler))
+		newStore(), sv, make(admins), slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "schema registry") {
 		t.Errorf("start without a registry: %v", err)
 	}

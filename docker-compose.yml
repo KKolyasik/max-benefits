@@ -69,6 +69,33 @@ services:
       retries: 10
     logging: *logging
 
+  # The agent as a service, as on the server: it runs on the schedule and
+  # when an admin presses the button in the bot. Only started on request,
+  # since its runs cost money:
+  #   docker compose --profile agent up -d --build agent
+  # Without a Yandex key it searches with SearXNG below.
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: ${AGENT_IMAGE:-max-benefits-agent:local}
+    profiles: [agent]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      KAFKA_BROKERS: kafka:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SEARXNG_URL: http://searxng:8080
+    # What the agent read last time: unchanged pages don't go to the model.
+    volumes:
+      - agent-data:/data
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    # Lets a run that is cut short report to the admins.
+    stop_grace_period: 30s
+    logging: *logging
+
   # Free metasearch for the agent when there is no Yandex Search API key.
   # Only started on request: docker compose --profile agent up -d searxng
   searxng:
@@ -143,3 +170,4 @@ volumes:
   redis-data:
   postgres-data:
   kafka-data:
+  agent-data:
