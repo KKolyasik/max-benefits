@@ -193,12 +193,20 @@ func TestApprovedDraftIsShownToStudentsAtOnce(t *testing.T) {
 	if !preview.Markdown || !strings.Contains(preview.Text, "**Грант**\nДеньги всем.") {
 		t.Errorf("the card must be previewed as students see it:\n%s", preview.Text)
 	}
+	if !strings.Contains(preview.Text, "1. [a.example](https://a.example/page)") {
+		t.Errorf("the sources go with the card:\n%s", preview.Text)
+	}
 	controls := admin.chat.last().Text
 	for _, want := range []string{"Черновик №1: новая карточка", "На проверке всего: 1", "Разделы: Деньги",
-		"Кому покажется: всем в разделе", "Запрос агента: «стипендия»", "1. https://a.example/page"} {
+		"Кому покажется: всем в разделе", "Запрос агента: «стипендия»"} {
 		if !strings.Contains(controls, want) {
 			t.Errorf("controls have no %q:\n%s", want, controls)
 		}
+	}
+	// A pressed button edits the message, and MAX edits it with a preview of
+	// the first link.
+	if strings.Contains(controls, "https://") {
+		t.Errorf("controls must have no links:\n%s", controls)
 	}
 	admin.press("Одобрить")
 	if got := admin.chat.lastAnswer().Edit.Text; !strings.HasSuffix(got, "👉 "+textApproved) {
@@ -213,6 +221,34 @@ func TestApprovedDraftIsShownToStudentsAtOnce(t *testing.T) {
 	student.press("Показать подборку")
 	if !strings.Contains(student.allText(), "**Грант**") {
 		t.Error("an approved card must be in the selection at once")
+	}
+}
+
+// Who will see the card is a list: an option may have commas and "или" of
+// its own.
+func TestDraftAudience(t *testing.T) {
+	admin, _, kb := newAdminSetup(t)
+	c := grant
+	c.Match = knowledge.Condition{"status": {"orphan", "poor"}, "uni": {"a"}}
+	kb.addDraft(c, "")
+	admin.say("/admin")
+	want := "Кому покажется:\n• Вуз: Вуз А\n• Статус, подходит любое из:\n   – Сирота\n   – Мало денег"
+	if got := admin.chat.last().Text; !strings.Contains(got, want) {
+		t.Errorf("controls:\n%s", got)
+	}
+}
+
+// A source is named by its site, and its address stays whole in the link.
+func TestSourcesText(t *testing.T) {
+	got := sourcesText([]string{"https://www.hse.ru/scholarships/pgas", "https://ru.wikipedia.org/wiki/Стипендия_(значения)", "::"})
+	for _, want := range []string{
+		"1. [hse.ru](https://www.hse.ru/scholarships/pgas)",
+		"2. [ru.wikipedia.org](https://ru.wikipedia.org/wiki/Стипендия_%28значения%29)",
+		"3. [страница](::)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in\n%s", want, got)
+		}
 	}
 }
 
