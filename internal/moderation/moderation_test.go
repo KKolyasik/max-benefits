@@ -1,6 +1,7 @@
 package moderation
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -79,12 +80,20 @@ func TestChanges(t *testing.T) {
 	}
 }
 
+// The conditions go in the order of the survey, and what the survey doesn't
+// know is shown by its ID rather than dropped.
 func TestAudience(t *testing.T) {
 	s := parse(t)
-	if got := Audience(card, s); got != "Основа: Бюджет или Платно; Форма: Очно" {
-		t.Errorf("got %q", got)
+	want := []Condition{{Question: "Форма", Options: []string{"Очно"}}, {Question: "Основа", Options: []string{"Бюджет", "Платно"}}}
+	if got := Audience(card, s); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v", got)
 	}
-	if got := Audience(knowledge.Card{}, s); got != "всем в разделе" {
-		t.Errorf("got %q", got)
+	odd := knowledge.Card{Match: knowledge.Condition{"zodiac": {"leo"}, "basis": {"budget", "free"}}}
+	want = []Condition{{Question: "Основа", Options: []string{"Бюджет", "free"}}, {Question: "zodiac", Options: []string{"leo"}}}
+	if got := Audience(odd, s); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v", got)
+	}
+	if got := Audience(knowledge.Card{}, s); len(got) != 0 {
+		t.Errorf("a card for everyone: %+v", got)
 	}
 }

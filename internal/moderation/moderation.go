@@ -116,20 +116,40 @@ func same(a, b any) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-// Audience describes a card's conditions in words: who will see it.
-func Audience(c knowledge.Card, s *survey.Survey) string {
-	var parts []string
-	for _, qid := range slices.Sorted(maps.Keys(c.Match)) {
-		opts := c.Match[qid]
-		q, ok := s.Question(qid)
+// Condition is one question of who sees a card: a student sees it if they
+// picked any of the options.
+type Condition struct {
+	// Question is the label of the question.
+	Question string
+	// Options are the titles of the options.
+	Options []string
+}
+
+// Audience returns who sees the card, question by question in the order of
+// the survey; none means everyone in the card's sections. A question or an
+// option the survey doesn't know is shown by its ID.
+func Audience(c knowledge.Card, s *survey.Survey) []Condition {
+	var out []Condition
+	known := map[string]bool{}
+	for _, q := range s.AllQuestions() {
+		opts, ok := c.Match[q.ID]
 		if !ok {
-			parts = append(parts, qid+": "+strings.Join(opts, ", "))
 			continue
 		}
-		parts = append(parts, q.Label+": "+strings.Join(q.Titles(opts), " или "))
+		known[q.ID] = true
+		titles := make([]string, len(opts))
+		for i, id := range opts {
+			titles[i] = id
+			if o, ok := q.Option(id); ok {
+				titles[i] = o.Title
+			}
+		}
+		out = append(out, Condition{Question: q.Label, Options: titles})
 	}
-	if len(parts) == 0 {
-		return "всем в разделе"
+	for _, qid := range slices.Sorted(maps.Keys(c.Match)) {
+		if !known[qid] {
+			out = append(out, Condition{Question: qid, Options: c.Match[qid]})
+		}
 	}
-	return strings.Join(parts, "; ")
+	return out
 }

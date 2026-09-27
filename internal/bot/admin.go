@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -238,6 +239,12 @@ func (b *Bot) nextDraft(ctx context.Context, after int64) (reply, error) {
 
 	var messages []Message
 	preview := []string{"👀 **Так карточку увидят студенты:**", renderEntry(d.Card.Preview())}
+	// The sources go here, not next to the buttons: a pressed button edits
+	// its message, and MAX edits a message only with a preview of its first
+	// link.
+	if len(d.Sources) > 0 {
+		preview = append(preview, sourcesText(d.Sources))
+	}
 	for _, text := range pack(preview, "\n\n", maxMessageRunes) {
 		messages = append(messages, Message{Text: text, Markdown: true})
 	}
@@ -263,7 +270,7 @@ func (b *Bot) draftControls(d moderation.Draft, current *knowledge.Card, problem
 			cats = append(cats, id)
 		}
 	}
-	fmt.Fprintf(&sb, "\nРазделы: %s\nКому покажется: %s", strings.Join(cats, ", "), moderation.Audience(d.Card, b.survey))
+	fmt.Fprintf(&sb, "\nРазделы: %s", strings.Join(cats, ", "))
 	if current != nil {
 		changes := moderation.Changes(*current, d.Card)
 		if len(changes) == 0 {
@@ -277,12 +284,7 @@ func (b *Bot) draftControls(d moderation.Draft, current *knowledge.Card, problem
 	if !d.FoundAt.IsZero() {
 		fmt.Fprintf(&sb, "\nНайдено: %s", d.FoundAt.Format("02.01.2006"))
 	}
-	if len(d.Sources) > 0 {
-		sb.WriteString("\n\nИсточники:")
-		for i, u := range d.Sources {
-			fmt.Fprintf(&sb, "\n%d. %s", i+1, u)
-		}
-	}
+	sb.WriteString("\n\n" + audienceText(moderation.Audience(d.Card, b.survey)))
 	if len(d.Notes) > 0 {
 		sb.WriteString("\n\n⚠️ Замечания агента:")
 		for _, n := range d.Notes {
@@ -307,6 +309,54 @@ func (b *Bot) draftControls(d moderation.Draft, current *knowledge.Card, problem
 		{{Text: labelMenu, Payload: actMenu}},
 	}}
 }
+
+// audienceText tells who will see the card: a condition a line, and the
+// options of a condition a line each, as their titles may have commas and
+// "или" of their own.
+func audienceText(conds []moderation.Condition) string {
+	if len(conds) == 0 {
+		return "Кому покажется: всем в разделе"
+	}
+	var sb strings.Builder
+	sb.WriteString("Кому покажется:")
+	for _, c := range conds {
+		switch len(c.Options) {
+		case 0:
+			fmt.Fprintf(&sb, "\n• %s: вариантов нет, никому", c.Question)
+		case 1:
+			fmt.Fprintf(&sb, "\n• %s: %s", c.Question, c.Options[0])
+		default:
+			fmt.Fprintf(&sb, "\n• %s, подходит любое из:", c.Question)
+			for _, o := range c.Options {
+				sb.WriteString("\n   – " + o)
+			}
+		}
+	}
+	return sb.String()
+}
+
+// sourcesText lists the pages the agent read, each a link named by its site.
+func sourcesText(pages []string) string {
+	var sb strings.Builder
+	sb.WriteString("🔎 **Источники агента** (студенты их не видят):")
+	for i, page := range pages {
+		fmt.Fprintf(&sb, "\n%d. [%s](%s)", i+1, siteName(page), linkTarget(page))
+	}
+	return sb.String()
+}
+
+// siteName is the site of a page, without www.
+func siteName(page string) string {
+	u, err := url.Parse(page)
+	if err != nil || u.Hostname() == "" {
+		return "страница"
+	}
+	return strings.TrimPrefix(u.Hostname(), "www.")
+}
+
+// linkTarget keeps an address whole in a markdown link, where a parenthesis
+// or a space would end it.
+var linkTarget = strings.NewReplacer("(", "%28", ")", "%29", " ", "%20").Replace
 
 // runAgent passes the command to the agent. The agent answers later, when
 // it starts: NotifyRun.

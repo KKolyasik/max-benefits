@@ -227,8 +227,9 @@ var (
 )
 
 func renderMarkdown(s string) string {
-	s = boldRe.ReplaceAllString(s, "\033[1m$1\033[0m")
-	return linkRe.ReplaceAllString(s, "$1 \033[4m$2\033[0m")
+	// Links first: the escape codes of bold have brackets of their own.
+	s = linkRe.ReplaceAllString(s, "$1 \033[4m$2\033[0m")
+	return boldRe.ReplaceAllString(s, "\033[1m$1\033[0m")
 }
 
 func dim(s string) string { return "\033[2m" + s + "\033[0m" }
