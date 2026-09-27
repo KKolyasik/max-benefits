@@ -60,7 +60,7 @@ type Collector struct {
 	Search  Searcher
 	Fetch   Fetcher
 	Model   Model
-	Drafts  Drafts
+	Drafts  Sink
 	State   *State
 	// Force sends pages to the model even if they did not change.
 	Force bool
@@ -173,7 +173,7 @@ func (c *Collector) Run(ctx context.Context) (Report, error) {
 }
 
 func fatal(err error) bool {
-	return errors.Is(err, search.ErrUnavailable) || errors.Is(err, llm.ErrUnreachable) ||
+	return errors.Is(err, search.ErrUnavailable) || errors.Is(err, llm.ErrUnreachable) || errors.Is(err, ErrSink) ||
 		errors.Is(err, llm.ErrUnauthorized) || errors.Is(err, ErrContextTooSmall) ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -209,7 +209,7 @@ func (c *Collector) query(ctx context.Context, q Query, r *run, log *slog.Logger
 	}
 	for _, p := range proposals {
 		r.drafts.Lock()
-		path, written, err := c.Drafts.Write(Draft{
+		path, written, err := c.Drafts.Write(ctx, Draft{
 			Query:   q.Text,
 			FoundAt: c.now(),
 			Updates: p.Updates,

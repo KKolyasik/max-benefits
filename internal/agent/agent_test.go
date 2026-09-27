@@ -150,7 +150,7 @@ func newCollector(t *testing.T, model *fakeModel, queries ...string) *Collector 
 
 func drafts(t *testing.T, c *Collector) []Draft {
 	t.Helper()
-	list, err := c.Drafts.List()
+	list, err := c.Drafts.(Drafts).List()
 	if err != nil {
 		t.Fatal(err)
 	}

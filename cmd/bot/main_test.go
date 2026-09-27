@@ -19,3 +19,31 @@ func TestParseIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestKafkaConfig(t *testing.T) {
+	cases := map[string]struct {
+		brokers, registry, db string
+		ok                    bool
+	}{
+		"no kafka":         {"", "", "", true},
+		"kafka":            {"kafka:9092, other:9092", "http://schema-registry:8081", "postgres://db", true},
+		"no registry":      {"kafka:9092", "", "postgres://db", false},
+		"registry only":    {"", "http://schema-registry:8081", "postgres://db", false},
+		"kafka without db": {"kafka:9092", "http://schema-registry:8081", "", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("MAX_BOT_TOKEN", "token")
+			t.Setenv("KAFKA_BROKERS", tc.brokers)
+			t.Setenv("SCHEMA_REGISTRY_URL", tc.registry)
+			t.Setenv("DATABASE_URL", tc.db)
+			cfg, err := loadConfig()
+			if (err == nil) != tc.ok {
+				t.Fatalf("err %v", err)
+			}
+			if name == "kafka" && !slices.Equal(cfg.KafkaBrokers, []string{"kafka:9092", "other:9092"}) {
+				t.Errorf("brokers %q", cfg.KafkaBrokers)
+			}
+		})
+	}
+}

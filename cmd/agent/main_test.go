@@ -9,7 +9,7 @@ import (
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"YANDEX_API_KEY", "YANDEX_FOLDER_ID", "SEARCH_PROVIDER", "LLM_BASE_URL",
-		"LLM_API_KEY", "LLM_MODEL", "LLM_PROJECT", "DRAFTS_DIR", "STATE_FILE", "YANDEX_ASYNC", "LLM_TOKEN_LIMIT"} {
+		"LLM_API_KEY", "LLM_MODEL", "LLM_PROJECT", "DRAFTS_DIR", "STATE_FILE", "YANDEX_ASYNC", "LLM_TOKEN_LIMIT", "KAFKA_BROKERS", "SCHEMA_REGISTRY_URL"} {
 		t.Setenv(k, "")
 	}
 }
@@ -105,5 +105,18 @@ func TestLoadDotEnv(t *testing.T) {
 	}
 	if got := os.Getenv("YANDEX_API_KEY"); got != "from-env" {
 		t.Errorf("the environment must win over the file: %q", got)
+	}
+}
+
+func TestConfigKafka(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("KAFKA_BROKERS", "localhost:9092, other:9092")
+	if _, err := loadConfig(); err == nil {
+		t.Error("KAFKA_BROKERS without SCHEMA_REGISTRY_URL must be an error")
+	}
+	t.Setenv("SCHEMA_REGISTRY_URL", "http://localhost:8085")
+	cfg, err := loadConfig()
+	if err != nil || len(cfg.KafkaBrokers) != 2 || cfg.KafkaBrokers[1] != "other:9092" {
+		t.Errorf("config %+v, err %v", cfg.KafkaBrokers, err)
 	}
 }

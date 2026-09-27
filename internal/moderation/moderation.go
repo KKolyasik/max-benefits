@@ -23,6 +23,9 @@ const (
 	Pending  Status = "pending"
 	Approved Status = "approved"
 	Rejected Status = "rejected"
+	// Superseded means a newer draft of the same card came before anyone
+	// reviewed this one.
+	Superseded Status = "superseded"
 )
 
 var (

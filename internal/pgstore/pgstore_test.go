@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -322,5 +323,104 @@ func TestConcurrentApproval(t *testing.T) {
 	}
 	if ok != 1 || decided != 1 {
 		t.Errorf("ok %d, decided %d", ok, decided)
+	}
+}
+
+// A newer draft of a card supersedes the one still waiting for review; the
+// same draft delivered again changes nothing.
+func TestNewerDraftSupersedesPending(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if _, err := s.Seed(ctx, seedCards, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	older, newer := seedCards[1], seedCards[1]
+	older.Summary, newer.Summary = "старая", "новая"
+	gym := knowledge.Card{ID: "gym", Categories: []string{"fun"}, Priority: 5, Title: "Зал", Summary: "зал"}
+	for _, add := range []struct {
+		id string
+		d  moderation.Draft
+	}{{"old", draft(older, "pass")}, {"gym", draft(gym, "")}, {"new", draft(newer, "pass")}} {
+		if _, err := s.AddDraft(ctx, add.id, add.d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if added, err := s.AddDraft(ctx, "new", draft(newer, "pass")); err != nil || added {
+		t.Fatalf("delivered again: added %v, %v", added, err)
+	}
+
+	var pending []string
+	for d, ok, err := s.NextDraft(ctx, 0); ok || err != nil; d, ok, err = s.NextDraft(ctx, d.ID) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending = append(pending, d.Card.Summary)
+	}
+	if strings.Join(pending, ",") != "зал,новая" {
+		t.Errorf("pending %v", pending)
+	}
+}
+
+// Decisions leave events for the agent in the outbox, in the same
+// transaction, and the relay can read what was decided.
+func TestDecisionsGoToTheOutbox(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if _, err := s.Seed(ctx, seedCards, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	var drafts []int64
+	for _, c := range []knowledge.Card{
+		{ID: "gym", Categories: []string{"fun"}, Priority: 5, Title: "Зал", Summary: "s"},
+		{ID: "cinema", Categories: []string{"fun"}, Priority: 5, Title: "Кино", Summary: "s"},
+		{ID: "zoo", Categories: []string{"fun"}, Priority: 5, Title: "Зоопарк", Summary: "s"},
+	} {
+		if _, err := s.AddDraft(ctx, "agent-"+c.ID, draft(c, "")); err != nil {
+			t.Fatal(err)
+		}
+		d, _, _ := s.NextDraft(ctx, 0)
+		for ok := true; ok && d.Card.ID != c.ID; {
+			d, ok, _ = s.NextDraft(ctx, d.ID)
+		}
+		drafts = append(drafts, d.ID)
+	}
+	if _, _, err := s.ApproveDraft(ctx, drafts[0], 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RejectDraft(ctx, drafts[1], 7); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Events(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gym, cinema := strconv.FormatInt(drafts[0], 10), strconv.FormatInt(drafts[1], 10)
+	want := []Event{{Kind: EventCard, Ref: "gym"}, {Kind: EventDecision, Ref: gym}, {Kind: EventDecision, Ref: cinema}}
+	if len(events) != len(want) {
+		t.Fatalf("events %+v", events)
+	}
+	for i := range want {
+		if events[i].Kind != want[i].Kind || events[i].Ref != want[i].Ref {
+			t.Errorf("event %d: %+v, want %+v", i, events[i], want[i])
+		}
+	}
+
+	d, ok, err := s.DraftDecision(ctx, gym)
+	if err != nil || !ok || d.ExternalID != "agent-gym" || d.CardID != "gym" || d.Status != moderation.Approved || d.DecidedAt.IsZero() {
+		t.Errorf("decision on gym: %+v %v %v", d, ok, err)
+	}
+	if d, ok, _ := s.DraftDecision(ctx, cinema); !ok || d.Status != moderation.Rejected {
+		t.Errorf("decision on cinema: %+v %v", d, ok)
+	}
+	if _, ok, err := s.DraftDecision(ctx, strconv.FormatInt(drafts[2], 10)); ok || err != nil {
+		t.Errorf("a pending draft has no decision: %v %v", ok, err)
+	}
+
+	if err := s.DeleteEvents(ctx, []int64{events[0].ID, events[1].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := s.Events(ctx, 10); len(left) != 1 || left[0].Ref != cinema {
+		t.Errorf("left %+v", left)
 	}
 }

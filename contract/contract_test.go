@@ -2,87 +2,22 @@ package contract
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/hamba/avro/v2"
 	"github.com/twmb/franz-go/pkg/sr"
+
+	"github.com/KKolyasik/max-benefits/contract/contracttest"
 )
 
-// registry fakes the few Schema Registry calls the codec makes.
-type registry struct {
-	mu       sync.Mutex
-	schemas  []string       // by ID - 1
-	subjects map[string]int // subject → the ID of its latest schema
-	compat   map[string]string
-}
-
-func newRegistry(t *testing.T) (*registry, *sr.Client) {
+func registered(t *testing.T) (*contracttest.Registry, *Codec) {
 	t.Helper()
-	r := &registry{subjects: map[string]int{}, compat: map[string]string{}}
-	srv := httptest.NewServer(r)
-	t.Cleanup(srv.Close)
-	cl, err := sr.NewClient(sr.URLs(srv.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return r, cl
-}
-
-func (r *registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	parts := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
-	switch {
-	case req.Method == http.MethodPut && parts[0] == "config":
-		var body struct {
-			Compatibility string `json:"compatibility"`
-		}
-		_ = json.NewDecoder(req.Body).Decode(&body)
-		r.compat[parts[1]] = body.Compatibility
-		_ = json.NewEncoder(w).Encode(body)
-	case req.Method == http.MethodPost && parts[0] == "subjects":
-		var body struct {
-			Schema string `json:"schema"`
-		}
-		_ = json.NewDecoder(req.Body).Decode(&body)
-		_ = json.NewEncoder(w).Encode(map[string]int{"id": r.add(parts[1], body.Schema)})
-	case req.Method == http.MethodGet && parts[0] == "schemas":
-		id, _ := strconv.Atoi(parts[2])
-		if id < 1 || id > len(r.schemas) {
-			http.Error(w, `{"error_code":40403,"message":"Schema not found"}`, http.StatusNotFound)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"schema": r.schemas[id-1]})
-	default:
-		http.NotFound(w, req)
-	}
-}
-
-func (r *registry) add(subject, schema string) int {
-	for i, s := range r.schemas {
-		if s == schema {
-			r.subjects[subject] = i + 1
-			return i + 1
-		}
-	}
-	r.schemas = append(r.schemas, schema)
-	r.subjects[subject] = len(r.schemas)
-	return len(r.schemas)
-}
-
-func registered(t *testing.T) (*registry, *Codec) {
-	t.Helper()
-	r, cl := newRegistry(t)
-	c := NewCodec(cl)
+	r := contracttest.NewRegistry(t)
+	c := NewCodec(r.Client())
 	if err := c.Register(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -140,20 +75,20 @@ func TestRegisteredSchemas(t *testing.T) {
 	want := []string{"maxbenefits.Card", "maxbenefits.Decision", "maxbenefits.Draft", "maxbenefits.RunCommand",
 		"maxbenefits.RunReport", "maxbenefits.Survey"}
 	var subjects []string
-	for s, id := range r.subjects {
+	for s, id := range r.Subjects() {
 		subjects = append(subjects, s)
-		if _, err := avro.ParseWithCache(r.schemas[id-1], "", &avro.SchemaCache{}); err != nil {
+		if _, err := avro.ParseWithCache(r.Schema(id), "", &avro.SchemaCache{}); err != nil {
 			t.Errorf("%s does not stand alone: %v", s, err)
 		}
-		if r.compat[s] != "FULL_TRANSITIVE" {
-			t.Errorf("%s is %q", s, r.compat[s])
+		if r.Compatibility(s) != "FULL_TRANSITIVE" {
+			t.Errorf("%s is %q", s, r.Compatibility(s))
 		}
 	}
 	slices.Sort(subjects)
 	if strings.Join(subjects, " ") != strings.Join(want, " ") {
 		t.Errorf("subjects %v", subjects)
 	}
-	draft := r.schemas[r.subjects["maxbenefits.Draft"]-1]
+	draft := r.Schema(r.Subjects()["maxbenefits.Draft"])
 	for _, part := range []string{`"name":"CardLink"`, `"default":""`, `"doc":"The agent run that made it."`} {
 		if !strings.Contains(draft, part) {
 			t.Errorf("the Draft schema has no %s:\n%s", part, draft)
@@ -163,7 +98,7 @@ func TestRegisteredSchemas(t *testing.T) {
 
 // written encodes v with another version of a schema, as another service
 // would, registering it in the fake registry.
-func written(t *testing.T, r *registry, subject, schemaJSON string, v any) []byte {
+func written(t *testing.T, r *contracttest.Registry, subject, schemaJSON string, v any) []byte {
 	t.Helper()
 	for _, s := range schemas {
 		if s.json == schemaJSON {
@@ -174,9 +109,7 @@ func written(t *testing.T, r *registry, subject, schemaJSON string, v any) []byt
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.mu.Lock()
-	id := r.add(subject+"-other", schemaJSON)
-	r.mu.Unlock()
+	id := r.Add(subject+"-other", schemaJSON)
 	data, err := avro.Marshal(s, v)
 	if err != nil {
 		t.Fatal(err)
@@ -242,8 +175,7 @@ func TestNewerVersionReads(t *testing.T) {
 }
 
 func TestCodecMisuse(t *testing.T) {
-	_, cl := newRegistry(t)
-	c := NewCodec(cl)
+	c := NewCodec(contracttest.NewRegistry(t).Client())
 	if _, err := c.Encode(&card); err == nil || !strings.Contains(err.Error(), "call Register") {
 		t.Errorf("encode before Register: %v", err)
 	}

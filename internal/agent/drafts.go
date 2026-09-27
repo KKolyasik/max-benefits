@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -17,13 +18,21 @@ import (
 	"github.com/KKolyasik/max-benefits/internal/knowledge"
 )
 
-const draftHeader = `# Черновик карточки от агента. Бот заберёт его и покажет админам, а те
-# одобрят или отклонят его прямо в чате.
+const draftHeader = `# Черновик карточки от агента, записанный без Kafka: бот его не увидит.
+# Чтобы черновики доходили до админов, задайте KAFKA_BROKERS и
+# SCHEMA_REGISTRY_URL.
 #
 # draft — откуда взялась карточка, в базу не попадает. card — сама карточка
 # в формате data/knowledge.yaml.
 
 `
+
+// Sink takes the drafts of a run.
+type Sink interface {
+	// Write keeps a draft and says where it went; false means a draft of
+	// the same card already waits for review, and this one is dropped.
+	Write(ctx context.Context, d Draft) (where string, written bool, err error)
+}
 
 // Draft is a card waiting for review, with where it came from.
 type Draft struct {
@@ -84,7 +93,7 @@ func (d Drafts) Load(path string) (Draft, error) {
 // Write saves a new draft named after its card. It doesn't overwrite a
 // draft that already waits for review, as it may have been edited, and
 // reports whether it wrote the file.
-func (d Drafts) Write(dr Draft) (path string, written bool, err error) {
+func (d Drafts) Write(_ context.Context, dr Draft) (path string, written bool, err error) {
 	path = filepath.Join(d.Dir, fileName(dr.Card)+".yaml")
 	if _, err := os.Stat(path); err == nil {
 		return path, false, nil

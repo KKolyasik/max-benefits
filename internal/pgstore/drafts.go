@@ -1,10 +1,12 @@
 package pgstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,9 +17,14 @@ import (
 
 const draftColumns = "id, card, updates, query, sources, notes, found_at, status"
 
+// draftTarget is the card a draft is about: the one it updates, or its own
+// ID for a new card.
+const draftTarget = "CASE WHEN updates <> '' THEN updates ELSE card->>'id' END"
+
 // AddDraft stores a draft from the agent. externalID identifies it at the
-// source: a draft delivered twice is stored once. It reports whether the
-// draft is new.
+// source: a draft delivered twice is stored once. A new draft supersedes the
+// drafts of the same card still waiting for review, as the newest is the one
+// worth reading. It reports whether the draft is new.
 func (s *Store) AddDraft(ctx context.Context, externalID string, d moderation.Draft) (bool, error) {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
@@ -25,13 +32,27 @@ func (s *Store) AddDraft(ctx context.Context, externalID string, d moderation.Dr
 	if err != nil {
 		return false, err
 	}
-	tag, err := s.db.Exec(ctx, `INSERT INTO drafts (external_id, card, updates, query, sources, notes, found_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (external_id) DO NOTHING`,
-		externalID, card, d.Updates, d.Query, nonNil(d.Sources), nonNil(d.Notes), d.FoundAt)
+	var added bool
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		var id int64
+		err := tx.QueryRow(ctx, `INSERT INTO drafts (external_id, card, updates, query, sources, notes, found_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (external_id) DO NOTHING RETURNING id`,
+			externalID, card, d.Updates, d.Query, nonNil(d.Sources), nonNil(d.Notes), d.FoundAt).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // delivered before
+		}
+		if err != nil {
+			return err
+		}
+		added = true
+		_, err = tx.Exec(ctx, "UPDATE drafts SET status = 'superseded', decided_at = now() WHERE status = 'pending' AND id <> $1 AND "+
+			draftTarget+" = $2", id, cmp.Or(d.Updates, d.Card.ID))
+		return err
+	})
 	if err != nil {
 		return false, fmt.Errorf("store draft: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+	return added, nil
 }
 
 // PendingDrafts counts drafts waiting for review.
@@ -109,6 +130,10 @@ func (s *Store) ApproveDraft(ctx context.Context, id, admin int64) (knowledge.Ca
 			id, admin); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, "INSERT INTO outbox (kind, ref) VALUES ($1, $2), ($3, $4)",
+			EventCard, d.Card.ID, EventDecision, strconv.FormatInt(id, 10)); err != nil {
+			return err
+		}
 		card, replaced = d.Card, current != nil
 		return nil
 	})
@@ -131,8 +156,11 @@ func (s *Store) RejectDraft(ctx context.Context, id, admin int64) error {
 		if _, err := lockDraft(ctx, tx, id); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, "UPDATE drafts SET status = 'rejected', decided_at = now(), decided_by = $2 WHERE id = $1",
-			id, admin)
+		if _, err := tx.Exec(ctx, "UPDATE drafts SET status = 'rejected', decided_at = now(), decided_by = $2 WHERE id = $1",
+			id, admin); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, "INSERT INTO outbox (kind, ref) VALUES ($1, $2)", EventDecision, strconv.FormatInt(id, 10))
 		return err
 	})
 	if err != nil {
