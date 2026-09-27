@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "Decision",
+  "namespace": "maxbenefits",
+  "doc": "What admins decided about a draft.",
+  "fields": [
+    {"name": "draft_id", "type": "string"},
+    {"name": "card_id", "type": "string"},
+    {"name": "verdict", "type": {"type": "enum", "name": "Verdict", "symbols": ["UNKNOWN", "APPROVED", "REJECTED"], "default": "UNKNOWN"}},
+    {"name": "decided_at", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}

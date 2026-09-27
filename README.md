@@ -91,7 +91,8 @@ MAX_BOT_TOKEN=... MAX_CA_FILE=certs/russian_trusted_root_ca.pem go run ./cmd/bot
 | [`internal/survey`](internal/survey/survey.go) | Рубрикатор и анкета из YAML |
 | [`cmd/agent`](cmd/agent/main.go) | Агент для наполнения базы: `collect` готовит черновики |
 | [`internal/inbox`](internal/inbox/inbox.go) | Временный канал агент → бот: бот забирает файлы черновиков из папки. Заменится на Kafka |
-| [`internal/agent`](internal/agent/collect.go) | Прогон агента, промпт, черновики и проверка. Внутри `search` (Yandex Search API, SearXNG), `fetch` (страницы и PDF), `llm` (OpenAI-совместимый API) |
+| [`internal/agent`](internal/agent/collect.go) | Прогон агента, промпт, черновики и проверка. Внутри `search` (Yandex Search API, SearXNG), `fetch` (страницы и PDF), `llm` (OpenAI-совместимый API и асинхронный режим Yandex AI Studio) |
+| [`contract`](contract/contract.go) | Контракт бота и агента: топики Kafka, сообщения, их схемы Avro и кодек для Schema Registry. Публичный пакет: агент импортирует его и из своего репозитория |
 
 ### Стейт-машина
 
@@ -221,6 +222,31 @@ go run ./cmd/agent collect
 
 Каждая версия карточки хранится в таблице `card_history`: кто, когда и из какого черновика её изменил.
 
+## Контракт: Kafka и Schema Registry
+
+Бот и агент будут общаться через Kafka, а формат сообщений закреплён схемами Avro в Schema Registry. Всё, о чём они договариваются, лежит в публичном пакете [`contract`](contract/contract.go): его импортирует и агент, когда переедет в свой репозиторий. Сами сервисы переходят на Kafka в следующих шагах, а пока черновики ходят через папку `DRAFTS_INBOX`.
+
+| Топик | Кто → кому | Ключ | Что внутри |
+|---|---|---|---|
+| `knowledge.drafts` | агент → бот | ID черновика | черновик карточки (`Draft`) |
+| `knowledge.cards` | бот → агент | ID карточки | актуальная база (`Card`), compacted |
+| `knowledge.survey` | бот → агент | `survey` | анкета (`Survey`), compacted |
+| `knowledge.decisions` | бот → агент | ID черновика | одобрено или отклонено (`Decision`), compacted: агент помнит отказы |
+| `agent.commands` | бот → агент | ID команды | «запусти прогон» из админки (`RunCommand`) |
+| `agent.runs` | агент → бот | ID прогона | отчёт о прогоне (`RunReport`) |
+
+- Схемы лежат в [`contract/avro`](contract/avro), по файлу на сообщение. Запись из другого файла (карточка внутри черновика) при регистрации подставляется целиком, поэтому в реестре каждая схема самодостаточна.
+- Сообщение идёт в формате Confluent: нулевой байт, ID схемы в реестре и данные Avro. Его прочитает любой клиент Schema Registry, например `kafka-avro-console-consumer`.
+- Схема регистрируется под полным именем записи (`maxbenefits.Draft` и т. д.) с совместимостью `FULL_TRANSITIVE`: сообщение любой версии читается любой другой. Поэтому бот и агента можно выкатывать в любом порядке, а схему можно менять только совместимо: новое поле — со значением по умолчанию, удалить — только поле со значением по умолчанию, новое значение enum — можно, старые читатели увидят `UNKNOWN`.
+- Сервисы регистрируют схемы при старте. Несовместимое изменение не даст сервису запуститься, и деплой откатится.
+- Топики создают сами сервисы (`contract.EnsureTopics`): одна партиция и одна реплика на единственный брокер. Автосоздание топиков в Kafka выключено.
+
+Локально Kafka и реестр поднимаются из `docker-compose.yml`: Kafka на `localhost:9092`, реестр на `localhost:8085`.
+
+```bash
+docker compose up -d --wait kafka schema-registry
+```
+
 ## Конфигурация
 
 | Переменная | По умолчанию | Описание |
@@ -282,6 +308,15 @@ go test ./...
   TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres go test ./internal/pgstore/
   ```
 
+- [`contract_test.go`](contract/contract_test.go): контракт: Go-типы и схемы совпадают поле в поле, в реестр уходят самодостаточные схемы со значениями по умолчанию, сообщения старой и новой версии схемы читаются.
+- [`kafka_test.go`](contract/kafka_test.go): контракт на настоящих Kafka и Schema Registry: топики создаются с нужными настройками, черновик проходит через Kafka, реестр отклоняет схему без обязательного поля. Без Kafka тест пропускается:
+  ```bash
+  docker compose up -d --wait kafka schema-registry
+  ```
+  ```bash
+  KAFKA_BROKERS=localhost:9092 SCHEMA_REGISTRY_URL=http://localhost:8085 go test ./contract/
+  ```
+
 Линтеры локально (как в CI):
 
 ```bash
@@ -289,7 +324,11 @@ docker run --rm -v "$PWD":/app -w /app golangci/golangci-lint:v2.13.2 golangci-l
 ```
 
 ```bash
-docker run --rm -i hadolint/hadolint:v2.15.1-debian hadolint - < Dockerfile
+docker run --rm -v "$PWD":/app -w /app hadolint/hadolint:v2.15.1-debian hadolint Dockerfile
+```
+
+```bash
+docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12 -color
 ```
 
 ## CI/CD и деплой
@@ -436,7 +475,7 @@ curl -i -X POST https://<домен>/webhook
 ## Что дальше
 
 - **Векторная БД.** Реализовать `knowledge.Base` поверх Qdrant (sparse и dense векторы) и подключить в `cmd/bot/main.go`. Бот при этом не меняется.
-- **Kafka между агентом и ботом.** Агент публикует черновики в `knowledge.drafts`, бот — анкету, карточки и решения админов в `knowledge.survey`, `knowledge.cards` и `knowledge.decisions`. Заменит папку `DRAFTS_INBOX`.
+- **Бот и агент на Kafka.** Контракт, Kafka и Schema Registry готовы (см. [«Контракт»](#контракт-kafka-и-schema-registry)). Дальше бот читает черновики из `knowledge.drafts` вместо папки `DRAFTS_INBOX` и через outbox в Postgres публикует карточки, анкету и решения админов. Потом агент становится сервисом: слушает команды и запускается по расписанию.
 - **Ручной прогон из админки.** Кнопка отправляет команду агенту через Kafka, агент по окончании присылает отчёт: сколько черновиков и токенов.
 - **Агент — отдельный сервис** в своём открытом репозитории, со своим расписанием: раз в неделю ночью.
 - **Правка и откат карточки в админке**: сейчас карточка меняется только через черновик агента, а откатить её можно по `card_history` запросом к базе.

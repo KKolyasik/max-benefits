@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "Card",
+  "namespace": "maxbenefits",
+  "doc": "A knowledge base card: one benefit, payment or opportunity.",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "categories", "type": {"type": "array", "items": "string"}, "doc": "Bot sections to show the card in, IDs from the survey."},
+    {"name": "priority", "type": "int", "doc": "1 to 100: higher goes first in a selection."},
+    {"name": "match", "type": {"type": "map", "values": {"type": "array", "items": "string"}}, "default": {},
+     "doc": "Who sees the card: question ID to the fitting option IDs. Empty means everyone in the section."},
+    {"name": "title", "type": "string"},
+    {"name": "summary", "type": "string"},
+    {"name": "steps", "type": {"type": "array", "items": "string"}, "default": []},
+    {"name": "documents", "type": {"type": "array", "items": "string"}, "default": []},
+    {"name": "where", "type": "string", "default": ""},
+    {"name": "links", "default": [], "type": {"type": "array", "items": {
+      "type": "record",
+      "name": "CardLink",
+      "fields": [
+        {"name": "title", "type": "string"},
+        {"name": "url", "type": "string"},
+        {"name": "when", "type": {"type": "map", "values": {"type": "array", "items": "string"}}, "default": {},
+         "doc": "Who sees the link, like match of the card."}
+      ]
+    }}}
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "RunCommand",
+  "namespace": "maxbenefits",
+  "doc": "An admin asks the agent to run now.",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "requested_at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "force", "type": "boolean", "default": false, "doc": "Send pages to the model even if they did not change."}
+  ]
+}
