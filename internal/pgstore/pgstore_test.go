@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/KKolyasik/max-benefits/internal/feedback"
 	"github.com/KKolyasik/max-benefits/internal/knowledge"
 	"github.com/KKolyasik/max-benefits/internal/moderation"
 	"github.com/KKolyasik/max-benefits/internal/survey"
@@ -422,5 +423,80 @@ func TestDecisionsGoToTheOutbox(t *testing.T) {
 	}
 	if left, _ := s.Events(ctx, 10); len(left) != 1 || left[0].Ref != cinema {
 		t.Errorf("left %+v", left)
+	}
+}
+
+func TestFeedback(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	day := time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
+	var ids []int64
+	for _, f := range []feedback.Feedback{
+		{UserID: 42, Text: "Идея", CreatedAt: day},
+		{UserID: 42, Category: "money", Answers: map[string][]string{"uni": {"a"}}, Text: "Нет гранта", CreatedAt: day.Add(time.Hour)},
+		{UserID: 7, Category: "money", Question: "uni", Text: "Нет вуза", CreatedAt: day.Add(2 * time.Hour)},
+	} {
+		id, err := s.AddFeedback(ctx, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	if n, err := s.UserFeedbackSince(ctx, 42, day.Add(time.Minute)); err != nil || n != 1 {
+		t.Errorf("feedback of a user since: %d, %v", n, err)
+	}
+	if n, err := s.PendingFeedback(ctx); err != nil || n != 3 {
+		t.Errorf("pending: %d, %v", n, err)
+	}
+	f, ok, err := s.NextFeedback(ctx, 0)
+	if err != nil || !ok || f.ID != ids[0] || f.UserID != 42 || f.Category != "" || f.Question != "" || len(f.Answers) != 0 ||
+		f.Text != "Идея" || !f.CreatedAt.Equal(day) {
+		t.Errorf("the first: %+v, %v, %v", f, ok, err)
+	}
+	f, _, _ = s.NextFeedback(ctx, ids[0])
+	if f.ID != ids[1] || f.Category != "money" || fmt.Sprint(f.Answers) != "map[uni:[a]]" {
+		t.Errorf("the second: %+v", f)
+	}
+
+	// Resolved twice: the first admin stays.
+	for _, admin := range []int64{1, 2} {
+		if err := s.ResolveFeedback(ctx, ids[1], admin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var by int64
+	if err := s.db.QueryRow(ctx, "SELECT resolved_by FROM feedback WHERE id = $1", ids[1]).Scan(&by); err != nil || by != 1 {
+		t.Errorf("resolved by %d, %v", by, err)
+	}
+	if n, _ := s.PendingFeedback(ctx); n != 2 {
+		t.Errorf("pending after resolving: %d", n)
+	}
+	if f, _, _ := s.NextFeedback(ctx, ids[0]); f.ID != ids[2] || f.Question != "uni" {
+		t.Errorf("a resolved feedback must be skipped: %+v", f)
+	}
+	if _, ok, err := s.NextFeedback(ctx, ids[2]); ok || err != nil {
+		t.Errorf("after the last: %v, %v", ok, err)
+	}
+
+	// The user deleted their data: the answers go, the text stays.
+	second := func() (answers map[string][]string, text string) {
+		t.Helper()
+		if err := s.db.QueryRow(ctx, "SELECT answers, text FROM feedback WHERE id = $1", ids[1]).Scan(&answers, &text); err != nil {
+			t.Fatal(err)
+		}
+		return answers, text
+	}
+	if err := s.ForgetFeedbackAnswers(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if answers, _ := second(); len(answers) != 1 {
+		t.Errorf("the answers of another user must stay: %v", answers)
+	}
+	if err := s.ForgetFeedbackAnswers(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if answers, text := second(); len(answers) != 0 || text != "Нет гранта" {
+		t.Errorf("the answers must be gone, the text must stay: %v, %q", answers, text)
 	}
 }

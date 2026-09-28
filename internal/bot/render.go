@@ -69,6 +69,9 @@ const (
 	labelOtherTopics = "🗂 Другие разделы"
 	labelEditAnswers = "✏️ Изменить анкету"
 	labelDone        = "✔️ Готово"
+	labelFeedback    = "💡 Предложить улучшения"
+	labelNoOption    = "✍️ Нет моего варианта"
+	labelMissing     = "✍️ Чего не хватает?"
 
 	labelDrafts    = "🛠 Черновики"
 	labelReview    = "📝 Разобрать"
@@ -79,6 +82,8 @@ const (
 	labelAgent     = "🤖 Агент"
 	labelRun       = "▶️ Запустить"
 	labelRunForce  = "🔁 Перечитать всё"
+	labelInbox     = "📬 Отзывы"
+	labelResolve   = "✔️ Разобрано"
 
 	textNoDrafts    = "Черновиков на проверке нет 🎉"
 	textLastDraft   = "Это был последний черновик. Пропущенные ждут проверки: %d."
@@ -93,14 +98,28 @@ const (
 	textAgentDown  = "Не получилось передать команду агенту: нет связи с Kafka 😔 Попробуй чуть позже."
 	textRunStarted = "▶️ Агент начал прогон. Когда закончит, пришлю отчёт."
 	textRunBusy    = "⏳ Агент занят другим прогоном и эту команду пропустил. Отчёт о текущем прогоне придёт, когда он закончится."
+
+	textNoFeedback   = "Неразобранных отзывов нет 🎉"
+	textLastFeedback = "Это был последний отзыв. Пропущенные ждут: %d."
+	textResolved     = "✔️ Разобрано"
+)
+
+const (
+	textAskIdea     = "💡 Что улучшить в боте? Может, не хватает раздела, льготы или твоего вуза в списке.\n\nНапиши одним сообщением, я передам команде."
+	textAskOption   = "✍️ Какого варианта не хватает в вопросе «%s»?\n\nНапиши одним сообщением, я передам команде. Потом вернёмся к анкете."
+	textAskMissing  = "✍️ Чего не хватает в разделе «%s»?\n\nНапиши одним сообщением, что тебе нужно. Я передам команде вместе с ответами анкеты: так будет понятно, что добавить."
+	textAskText     = "Пришли, пожалуйста, отзыв текстом 🙂"
+	textThanks      = "Спасибо! Я передал это команде 🙌"
+	textThanksBack  = "Спасибо, передал команде 🙌 А пока выбери ближайший вариант 👇"
+	textWroteEnough = "Спасибо, на сегодня отзывов хватит 🙏 Напиши завтра"
 )
 
 const textAgent = `🤖 Агент ищет в интернете свежие сведения для разделов бота и присылает черновики карточек на проверку. По расписанию он запускается сам, а здесь его можно запустить сейчас.
 
 Страницы, которые не изменились с прошлого прогона, агент модели не отправляет, поэтому обычный прогон обходится дёшево. «Перечитать всё» отправит модели все страницы заново: это дороже, зато пригодится, если агента настроили по-новому.`
 
-// menuMessage is the main menu; admins also get the drafts and the agent
-// buttons.
+// menuMessage is the main menu; admins also get the drafts, the agent and
+// the feedback buttons.
 func (b *Bot) menuMessage(userID int64, text string) Message {
 	var kb [][]Button
 	for _, c := range b.survey.Categories {
@@ -111,12 +130,18 @@ func (b *Bot) menuMessage(userID int64, text string) Message {
 		if b.agent != nil {
 			row = append(row, Button{Text: labelAgent, Payload: actAgent})
 		}
+		if b.feedback != nil {
+			row = append(row, Button{Text: labelInbox, Payload: actInbox})
+		}
 		kb = append(kb, row)
 	}
 	kb = append(kb, []Button{
 		{Text: labelProfile, Payload: actProfile},
 		{Text: labelAbout, Payload: actAbout},
 	})
+	if b.feedback != nil {
+		kb = append(kb, []Button{{Text: labelFeedback, Payload: actFeedback}})
+	}
 	return Message{Text: text, Keyboard: kb}
 }
 
@@ -154,6 +179,9 @@ func (b *Bot) questionMessage(c *survey.Category, q *survey.Question, pos int, s
 	kb := layout(buttons)
 	if q.Multi {
 		kb = append(kb, []Button{{Text: labelDone, Payload: payload(actDone, q.ID)}})
+	}
+	if b.feedback != nil {
+		kb = append(kb, []Button{{Text: labelNoOption, Payload: payload(actFeedback, c.ID, q.ID)}})
 	}
 	nav := []Button{{Text: labelMenu, Payload: actMenu}}
 	if pos > 1 {
@@ -341,10 +369,15 @@ func linkButtons(links []knowledge.Link) [][]Button {
 
 // clip cuts a text from the knowledge base to fit a button.
 func clip(s string) string {
-	if utf8.RuneCountInString(s) <= maxButtonRunes {
+	return cut(s, maxButtonRunes)
+}
+
+// cut shortens a text to limit runes, marking the cut with "…".
+func cut(s string, limit int) string {
+	if utf8.RuneCountInString(s) <= limit {
 		return s
 	}
-	return string([]rune(s)[:maxButtonRunes-1]) + "…"
+	return string([]rune(s)[:limit-1]) + "…"
 }
 
 // plural picks the form of a noun for n: 1 пункт, 3 пункта, 7 пунктов.

@@ -134,10 +134,10 @@ func run() error {
 
 	b := bot.New(sv, kb, store, client, log)
 	if cards != nil {
-		b.WithModeration(cards, cfg.AdminIDs)
+		b.WithModeration(cards, cfg.AdminIDs).WithFeedback(cards)
 		if cfg.AdminForAll {
 			b.WithAdminForAll()
-			log.Warn("ADMIN_FOR_ALL is on: every user can review drafts and run the agent; turn it off when the review is over")
+			log.Warn("ADMIN_FOR_ALL is on: every user can review drafts, read the feedback and run the agent; turn it off when the review is over")
 		}
 		if len(cfg.KafkaBrokers) > 0 {
 			// Stopped before the database closes: the bus works with it.

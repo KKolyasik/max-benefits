@@ -3,8 +3,9 @@
 //
 //	go run ./cmd/cli
 //
-// With a database it also shows the admin screens, e.g. to review the
-// agent's drafts and to run it through Kafka:
+// With a database it also takes feedback and shows the admin screens, e.g.
+// to review the agent's drafts and the feedback and to run the agent
+// through Kafka:
 //
 //	go run ./cmd/cli -db postgres://... -admin -kafka localhost:9092 -registry http://localhost:8085
 //
@@ -94,6 +95,9 @@ func run(o options) error {
 
 	term := &console{}
 	b := bot.New(sv, kb, session.NewMemory(), term, slog.New(slog.DiscardHandler))
+	if store != nil {
+		b.WithFeedback(store)
+	}
 	if o.admin {
 		b.WithModeration(store, []int64{userID})
 	}

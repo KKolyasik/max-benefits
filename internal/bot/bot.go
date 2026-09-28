@@ -5,6 +5,9 @@
 //	  └──category (already filled)──▶ confirm ──"заполнить заново"──┘
 //	                                     └──"показать подборку"──▶ results
 //
+// From the menu, a question or empty results the user may write to the
+// team: feedback takes the next text and goes back to where it started.
+//
 // The state and answers live in session.Store and are saved after every
 // event, before anything is sent, so progress is never lost.
 //
@@ -37,11 +40,12 @@ type Bot struct {
 	log    *slog.Logger
 	now    func() time.Time
 	// mod and admins are set by WithModeration, adminForAll by
-	// WithAdminForAll, agent by WithAgent.
+	// WithAdminForAll, agent by WithAgent, feedback by WithFeedback.
 	mod         Moderation
 	admins      map[int64]bool
 	adminForAll bool
 	agent       Agent
+	feedback    Feedback
 }
 
 func New(s *survey.Survey, kb knowledge.Base, store session.Store, out Messenger, log *slog.Logger) *Bot {
@@ -168,10 +172,22 @@ func (b *Bot) onText(ctx context.Context, ev Event, sess *session.Session) (repl
 			b.toMenu(sess)
 			return show(agentMessage()), nil
 		}
+	case "/feedback", "отзывы":
+		if b.isAdmin(ev.UserID) && b.feedback != nil {
+			b.toMenu(sess)
+			return b.nextFeedback(ctx, 0)
+		}
 	case "/profile", "анкета", "моя анкета":
+		b.leaveFeedback(sess)
 		return show(b.profileMessage(sess.Answers)), nil
 	case "/help", "/about", "помощь":
+		b.leaveFeedback(sess)
 		return show(aboutMessage()), nil
+	}
+
+	// Any text but a command is the feedback the bot waits for.
+	if sess.State == session.StateFeedback && !strings.HasPrefix(strings.TrimSpace(ev.Text), "/") {
+		return b.takeFeedback(ctx, ev.UserID, sess, ev.Text)
 	}
 
 	// Free-form questions are out of scope for the MVP: gently steer the
@@ -191,6 +207,10 @@ func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (
 		}
 		return ""
 	}
+	if sess.State == session.StateFeedback && action != actFeedbackCancel {
+		// A button of another message: the user goes on without writing.
+		b.leaveFeedback(sess)
+	}
 
 	switch action {
 	case actMenu:
@@ -207,6 +227,13 @@ func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (
 		return show(deleteConfirmMessage()), nil
 
 	case actDeleteConfirm:
+		// The answers go with the feedback about empty results too. If they
+		// can't be deleted, nothing is: the user is told and may try again.
+		if b.feedback != nil {
+			if err := b.feedback.ForgetFeedbackAnswers(ctx, ev.UserID); err != nil {
+				return reply{}, err
+			}
+		}
 		r := show(b.menuMessage(ev.UserID, textDeleted))
 		r.forget = true
 		return r, nil
@@ -312,8 +339,20 @@ func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (
 		q, pos = b.survey.Next(c, sess.Answers)
 		return show(b.questionMessage(c, q, pos, sess.Selected, "")), nil
 
+	case actFeedback:
+		return b.askFeedback(ctx, ev.UserID, sess, arg(0), arg(1))
+
+	case actFeedbackCancel:
+		if sess.State != session.StateFeedback {
+			return stale(), nil
+		}
+		return b.closeFeedback(ctx, ev.UserID, sess, false)
+
 	case actDrafts, actApprove, actReject, actSkip, actAgent, actRun:
 		return b.onAdmin(ctx, ev, action, arg(0))
+
+	case actInbox, actResolve, actPass, actResolveNotice:
+		return b.onInbox(ctx, ev, action, arg(0))
 
 	default:
 		return stale(), nil
@@ -323,6 +362,7 @@ func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (
 func (b *Bot) toMenu(sess *session.Session) {
 	sess.State = session.StateMenu
 	sess.Category = ""
+	sess.Question = ""
 	sess.Selected = nil
 }
 
@@ -365,7 +405,11 @@ func (b *Bot) results(ctx context.Context, c *survey.Category, answers map[strin
 	if card, ok := cardMessage(c, entries, id, part); ok {
 		return show(card), nil
 	}
-	return show(resultsMessage(c, entries)), nil
+	msg := resultsMessage(c, entries)
+	if len(entries) == 0 && b.feedback != nil {
+		msg.Keyboard = append([][]Button{{{Text: labelMissing, Payload: payload(actFeedback, c.ID)}}}, msg.Keyboard...)
+	}
+	return show(msg), nil
 }
 
 // current returns the question the user is expected to answer now.

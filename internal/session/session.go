@@ -17,6 +17,9 @@ const (
 	StateConfirm State = "confirm"
 	// StateSurvey: the user is answering questions of Category.
 	StateSurvey State = "survey"
+	// StateFeedback: the bot waits for the user to write to the team.
+	// Category and Question tell what about, if anything.
+	StateFeedback State = "feedback"
 )
 
 // Session is everything the bot remembers about a user. Answers are saved
@@ -28,6 +31,9 @@ type Session struct {
 	// Selected holds options ticked in the current multi-choice question
 	// that are not confirmed with "Готово" yet.
 	Selected []string `json:"selected,omitempty"`
+	// Question is the question of Category the user writes feedback about:
+	// none of its options fits.
+	Question string `json:"question,omitempty"`
 	// Answers maps question IDs to chosen option IDs. Questions are shared
 	// between categories, so the user is never asked the same thing twice.
 	Answers   map[string][]string `json:"answers,omitempty"`

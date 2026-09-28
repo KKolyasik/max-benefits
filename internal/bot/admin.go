@@ -89,9 +89,7 @@ func (b *Bot) NotifyRun(ctx context.Context, r moderation.Run) error {
 	default:
 		return nil
 	}
-	if h := b.now().Hour(); h >= 22 || h < 8 {
-		msg.Silent = true
-	}
+	msg.Silent = b.night()
 	var errs []error
 	for id := range b.admins {
 		if err := b.out.Send(ctx, id, msg); err != nil {
@@ -99,6 +97,12 @@ func (b *Bot) NotifyRun(ctx context.Context, r moderation.Run) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// night is when the news for the admins comes without a sound.
+func (b *Bot) night() bool {
+	h := b.now().Hour()
+	return h >= 22 || h < 8
 }
 
 // runText tells how a run ended.
