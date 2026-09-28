@@ -154,7 +154,8 @@ func newAdminSetup(t *testing.T) (admin, student *user, kb *base) {
 	return admin, student, kb
 }
 
-var grant = knowledge.Card{ID: "grant", Categories: []string{"money"}, Priority: 50, Title: "Грант", Summary: "Деньги всем."}
+var grant = knowledge.Card{ID: "grant", Categories: []string{"money"}, Priority: 50, Title: "Грант", Summary: "Деньги всем.",
+	Links: []knowledge.CardLink{{Title: "Сайт гранта", URL: "https://grant.example"}}}
 
 func (u *user) hasButton(text string) bool {
 	u.chat.mu.Lock()
@@ -196,6 +197,9 @@ func TestApprovedDraftIsShownToStudentsAtOnce(t *testing.T) {
 	if !strings.Contains(preview.Text, "1. [a.example](https://a.example/page)") {
 		t.Errorf("the sources go with the card:\n%s", preview.Text)
 	}
+	if kb := preview.Keyboard; len(kb) != 1 || kb[0][0].Text != "🔗 Сайт гранта" || kb[0][0].URL != "https://grant.example" {
+		t.Errorf("the links of the card are buttons, as students get them: %+v", kb)
+	}
 	controls := admin.chat.last().Text
 	for _, want := range []string{"Черновик №1: новая карточка", "На проверке всего: 1", "Разделы: Деньги",
 		"Кому покажется: всем в разделе", "Запрос агента: «стипендия»"} {
@@ -219,8 +223,9 @@ func TestApprovedDraftIsShownToStudentsAtOnce(t *testing.T) {
 	student.press("Другие разделы")
 	student.press("Деньги")
 	student.press("Показать подборку")
-	if !strings.Contains(student.allText(), "**Грант**") {
-		t.Error("an approved card must be in the selection at once")
+	student.press("Грант")
+	if got := student.chat.last().Text; !strings.Contains(got, "**Грант**\nДеньги всем.") {
+		t.Errorf("an approved card must be in the selection at once:\n%s", got)
 	}
 }
 

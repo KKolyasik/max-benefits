@@ -7,6 +7,11 @@
 //
 // The state and answers live in session.Store and are saved after every
 // event, before anything is sent, so progress is never lost.
+//
+// A pressed button changes its own message: the menu, the questions and the
+// cards of the results are screens that replace one another in one message
+// rather than a new message for every step. Only the admins' decisions on
+// drafts stay in the chat as a trail.
 package bot
 
 import (
@@ -15,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,13 +46,22 @@ func New(s *survey.Survey, kb knowledge.Base, store session.Store, out Messenger
 	return &Bot{survey: s, kb: kb, store: store, out: out, log: log, now: time.Now}
 }
 
-// reply is the outcome of a transition: what to answer to the pressed button
-// and which messages to send afterwards.
+// reply is the outcome of a transition.
 type reply struct {
-	answer   *CallbackAnswer
+	// screen takes the place of the message with the pressed button. A typed
+	// command gets it as a new message.
+	screen *Message
+	// messages are sent as new ones, after the screen.
 	messages []Message
+	// notification is a toast for the one who pressed the button.
+	notification string
 	// forget deletes the session instead of saving it.
 	forget bool
+}
+
+// show is a reply with the next screen.
+func show(screen Message) reply {
+	return reply{screen: &screen}
 }
 
 // Handle processes one user event. Events of the same user must be handled
@@ -84,29 +99,33 @@ func (b *Bot) Handle(ctx context.Context, ev Event) error {
 
 // failure tells the user something broke and offers the menu to go on.
 func (b *Bot) failure(ev Event) reply {
-	r := reply{messages: []Message{b.menuMessage(ev.UserID, textFailed)}}
-	if ev.Type == EventCallback {
-		r.answer = &CallbackAnswer{Notification: textFailed}
-	}
-	return r
+	return show(b.menuMessage(ev.UserID, textFailed))
 }
 
 func (b *Bot) deliver(ctx context.Context, ev Event, r reply) error {
 	var errs []error
-	if ev.Type == EventCallback {
-		answer := r.answer
-		if answer == nil {
-			answer = freeze(ev, "")
+	messages := r.messages
+	switch {
+	case ev.Type == EventCallback:
+		answer := CallbackAnswer{Notification: r.notification}
+		if ev.SourceText != "" {
+			answer.Edit = r.screen
+		} else if r.screen != nil {
+			// The message was deleted before the press arrived: the screen
+			// comes as a new one.
+			messages = append([]Message{*r.screen}, messages...)
 		}
 		if answer.Edit == nil && answer.Notification == "" {
 			// MAX needs either an edit or a notification to acknowledge a press.
 			answer.Notification = "✓"
 		}
-		if err := b.out.AnswerCallback(ctx, ev.UserID, ev.CallbackID, *answer); err != nil {
+		if err := b.out.AnswerCallback(ctx, ev.UserID, ev.CallbackID, answer); err != nil {
 			errs = append(errs, fmt.Errorf("answer callback: %w", err))
 		}
+	case r.screen != nil:
+		messages = append([]Message{*r.screen}, messages...)
 	}
-	for _, msg := range r.messages {
+	for _, msg := range messages {
 		if err := b.out.Send(ctx, ev.UserID, msg); err != nil {
 			errs = append(errs, fmt.Errorf("send message: %w", err))
 			break // keep the order: do not send the rest after a gap
@@ -119,7 +138,7 @@ func (b *Bot) transition(ctx context.Context, ev Event, sess *session.Session) (
 	switch ev.Type {
 	case EventStart:
 		b.toMenu(sess)
-		return reply{messages: []Message{b.menuMessage(ev.UserID, textWelcome)}}, nil
+		return show(b.menuMessage(ev.UserID, textWelcome)), nil
 	case EventText:
 		return b.onText(ctx, ev, sess)
 	case EventCallback:
@@ -133,10 +152,10 @@ func (b *Bot) onText(ctx context.Context, ev Event, sess *session.Session) (repl
 	switch strings.ToLower(strings.TrimSpace(ev.Text)) {
 	case "/start", "start", "начать", "старт", "привет":
 		b.toMenu(sess)
-		return reply{messages: []Message{b.menuMessage(ev.UserID, textWelcome)}}, nil
+		return show(b.menuMessage(ev.UserID, textWelcome)), nil
 	case "/menu", "menu", "меню":
 		b.toMenu(sess)
-		return reply{messages: []Message{b.menuMessage(ev.UserID, textMenu)}}, nil
+		return show(b.menuMessage(ev.UserID, textMenu)), nil
 	case "/admin", "/drafts", "черновики":
 		if b.isAdmin(ev.UserID) {
 			b.toMenu(sess)
@@ -145,21 +164,21 @@ func (b *Bot) onText(ctx context.Context, ev Event, sess *session.Session) (repl
 	case "/agent", "агент":
 		if b.isAdmin(ev.UserID) && b.agent != nil {
 			b.toMenu(sess)
-			return reply{messages: []Message{agentMessage()}}, nil
+			return show(agentMessage()), nil
 		}
 	case "/profile", "анкета", "моя анкета":
-		return reply{messages: []Message{b.profileMessage(sess.Answers)}}, nil
+		return show(b.profileMessage(sess.Answers)), nil
 	case "/help", "/about", "помощь":
-		return reply{messages: []Message{aboutMessage()}}, nil
+		return show(aboutMessage()), nil
 	}
 
 	// Free-form questions are out of scope for the MVP: gently steer the
 	// user back to the buttons, repeating the current question if any.
 	if c, q, pos := b.current(sess); q != nil {
-		return reply{messages: []Message{b.questionMessage(c, q, pos, sess.Selected, textAnswerButton)}}, nil
+		return show(b.questionMessage(c, q, pos, sess.Selected, textAnswerButton)), nil
 	}
 	b.toMenu(sess)
-	return reply{messages: []Message{b.menuMessage(ev.UserID, textUseButtons+"\n\n"+textMenu)}}, nil
+	return show(b.menuMessage(ev.UserID, textUseButtons+"\n\n"+textMenu)), nil
 }
 
 func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (reply, error) {
@@ -174,108 +193,128 @@ func (b *Bot) onCallback(ctx context.Context, ev Event, sess *session.Session) (
 	switch action {
 	case actMenu:
 		b.toMenu(sess)
-		return reply{answer: freeze(ev, labelMenu), messages: []Message{b.menuMessage(ev.UserID, textMenu)}}, nil
+		return show(b.menuMessage(ev.UserID, textMenu)), nil
 
 	case actProfile:
-		return reply{answer: freeze(ev, labelProfile), messages: []Message{b.profileMessage(sess.Answers)}}, nil
+		return show(b.profileMessage(sess.Answers)), nil
 
 	case actAbout:
-		return reply{answer: freeze(ev, labelAbout), messages: []Message{aboutMessage()}}, nil
+		return show(aboutMessage()), nil
 
 	case actDelete:
-		return reply{answer: freeze(ev, labelDelete), messages: []Message{deleteConfirmMessage()}}, nil
+		return show(deleteConfirmMessage()), nil
 
 	case actDeleteConfirm:
-		return reply{
-			answer:   freeze(ev, labelDeleteYes),
-			messages: []Message{b.menuMessage(ev.UserID, textDeleted)},
-			forget:   true,
-		}, nil
+		r := show(b.menuMessage(ev.UserID, textDeleted))
+		r.forget = true
+		return r, nil
 
 	case actCategory:
 		c, ok := b.survey.Category(arg(0))
 		if !ok {
-			return stale(ev), nil
+			return stale(), nil
 		}
-		r := b.openCategory(sess, c)
-		r.answer = freeze(ev, c.Title)
-		return r, nil
+		return show(b.openCategory(sess, c)), nil
 
 	case actUseSaved:
 		c, ok := b.survey.Category(arg(0))
 		if !ok {
-			return stale(ev), nil
+			return stale(), nil
 		}
-		var r reply
-		var err error
-		if b.survey.Complete(c, sess.Answers) {
-			b.toMenu(sess)
-			r, err = b.results(ctx, c, sess)
-		} else {
+		if !b.survey.Complete(c, sess.Answers) {
 			// Questions were added to the category since the user filled it.
-			r = b.openCategory(sess, c)
+			return show(b.openCategory(sess, c)), nil
 		}
-		r.answer = freeze(ev, labelUseSaved)
-		return r, err
+		b.toMenu(sess)
+		return b.results(ctx, c, sess.Answers, "", 0)
 
 	case actRedo:
 		c, ok := b.survey.Category(arg(0))
 		if !ok {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		for _, qid := range c.Questions {
 			delete(sess.Answers, qid)
 		}
-		r := b.openCategory(sess, c)
-		r.answer = freeze(ev, labelRedo)
-		return r, nil
+		return show(b.openCategory(sess, c)), nil
+
+	case actResults, actCard:
+		c, ok := b.survey.Category(arg(0))
+		if !ok {
+			return stale(), nil
+		}
+		if !b.survey.Complete(c, sess.Answers) {
+			// The answers changed since the results were shown.
+			return show(b.openCategory(sess, c)), nil
+		}
+		var id string
+		part, _ := strconv.Atoi(arg(1))
+		if len(args) > 2 {
+			id = strings.Join(args[2:], ":")
+		}
+		return b.results(ctx, c, sess.Answers, id, part)
 
 	case actAnswer:
 		c, q, _ := b.current(sess)
 		if q == nil || q.Multi || q.ID != arg(0) {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		o, ok := q.Option(arg(1))
 		if !ok {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		sess.Answers[q.ID] = []string{o.ID}
-		r, err := b.advance(ctx, c, sess)
-		r.answer = freeze(ev, o.Title)
-		return r, err
+		sess.Selected = nil
+		return b.advance(ctx, c, sess)
 
 	case actToggle:
 		c, q, pos := b.current(sess)
 		if q == nil || !q.Multi || q.ID != arg(0) {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		o, ok := q.Option(arg(1))
 		if !ok {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		sess.Selected = toggle(q, sess.Selected, o)
-		edit := b.questionMessage(c, q, pos, sess.Selected, "")
-		return reply{answer: &CallbackAnswer{Edit: &edit}}, nil
+		msg := b.questionMessage(c, q, pos, sess.Selected, "")
+		if ev.SourceText != "" {
+			// Only the ticks change. The text stays as it is, intro and all,
+			// so the buttons do not jump under the finger.
+			msg.Text = ev.SourceText
+		}
+		return show(msg), nil
 
 	case actDone:
 		c, q, _ := b.current(sess)
 		if q == nil || !q.Multi || q.ID != arg(0) {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		if len(sess.Selected) == 0 {
-			return reply{answer: &CallbackAnswer{Notification: textPickOne}}, nil
+			return reply{notification: textPickOne}, nil
 		}
 		sess.Answers[q.ID] = sess.Selected
 		sess.Selected = nil
-		r, err := b.advance(ctx, c, sess)
-		r.answer = freeze(ev, strings.Join(q.Titles(sess.Answers[q.ID]), ", "))
-		return r, err
+		return b.advance(ctx, c, sess)
+
+	case actBack:
+		c, q, pos := b.current(sess)
+		if q == nil || q.ID != arg(0) || pos < 2 {
+			return stale(), nil
+		}
+		// Forgetting the previous answer makes its question the current one
+		// again; the old choice comes back ticked.
+		prev := c.Questions[pos-2]
+		sess.Selected = sess.Answers[prev]
+		delete(sess.Answers, prev)
+		q, pos = b.survey.Next(c, sess.Answers)
+		return show(b.questionMessage(c, q, pos, sess.Selected, "")), nil
 
 	case actDrafts, actApprove, actReject, actSkip, actAgent, actRun:
 		return b.onAdmin(ctx, ev, action, arg(0))
 
 	default:
-		return stale(ev), nil
+		return stale(), nil
 	}
 }
 
@@ -287,42 +326,44 @@ func (b *Bot) toMenu(sess *session.Session) {
 
 // openCategory starts (or resumes) the category questionnaire, or offers to
 // reuse the answers if it is already complete.
-func (b *Bot) openCategory(sess *session.Session, c *survey.Category) reply {
+func (b *Bot) openCategory(sess *session.Session, c *survey.Category) Message {
 	sess.Category = c.ID
 	sess.Selected = nil
 	if b.survey.Complete(c, sess.Answers) {
 		sess.State = session.StateConfirm
-		return reply{messages: []Message{b.confirmMessage(c, sess.Answers)}}
+		return b.confirmMessage(c, sess.Answers)
 	}
 
 	sess.State = session.StateSurvey
 	q, pos := b.survey.Next(c, sess.Answers)
-	preface := c.Title
-	if c.Intro != "" {
-		preface += "\n" + strings.TrimSpace(c.Intro)
-	}
+	note := strings.TrimSpace(c.Intro)
 	if answered := b.survey.Answered(c, sess.Answers); answered > 0 {
-		preface = fmt.Sprintf("%s\nЧасть ответов у меня уже есть, продолжаем с вопроса %d 👌", c.Title, pos)
+		note = fmt.Sprintf("Часть ответов у меня уже есть, продолжаем с вопроса %d 👌", pos)
 	}
-	return reply{messages: []Message{b.questionMessage(c, q, pos, nil, preface)}}
+	return b.questionMessage(c, q, pos, nil, note)
 }
 
 // advance asks the next question or, when the questionnaire is complete,
 // shows the results.
 func (b *Bot) advance(ctx context.Context, c *survey.Category, sess *session.Session) (reply, error) {
 	if q, pos := b.survey.Next(c, sess.Answers); q != nil {
-		return reply{messages: []Message{b.questionMessage(c, q, pos, sess.Selected, "")}}, nil
+		return show(b.questionMessage(c, q, pos, nil, "")), nil
 	}
 	b.toMenu(sess)
-	return b.results(ctx, c, sess)
+	return b.results(ctx, c, sess.Answers, "", 0)
 }
 
-func (b *Bot) results(ctx context.Context, c *survey.Category, sess *session.Session) (reply, error) {
-	entries, err := b.kb.Find(ctx, knowledge.Request{Category: c.ID, Answers: sess.Answers})
+// results shows the cards found for the answers: the card with the given ID
+// or, if there is no such card among them, the list of them all.
+func (b *Bot) results(ctx context.Context, c *survey.Category, answers map[string][]string, id string, part int) (reply, error) {
+	entries, err := b.kb.Find(ctx, knowledge.Request{Category: c.ID, Answers: answers})
 	if err != nil {
 		return reply{}, fmt.Errorf("knowledge base: %w", err)
 	}
-	return reply{messages: resultMessages(c, entries)}, nil
+	if card, ok := cardMessage(c, entries, id, part); ok {
+		return show(card), nil
+	}
+	return show(resultsMessage(c, entries)), nil
 }
 
 // current returns the question the user is expected to answer now.
@@ -359,29 +400,22 @@ func toggle(q *survey.Question, selected []string, o *survey.Option) []string {
 	return out
 }
 
-// freeze answers a button press by replacing the message's keyboard with the
-// chosen option, so the chat reads like a conversation and old buttons
-// cannot be pressed again.
-func freeze(ev Event, choice string) *CallbackAnswer {
+// freeze keeps the pressed message in the chat with the choice made and
+// without its buttons, and the rest of the reply comes in new messages. This
+// way the admins' decisions leave a trail; other presses flip the screen.
+func freeze(ev Event, choice string, r reply) reply {
 	if ev.SourceText == "" {
-		return &CallbackAnswer{Notification: choice}
+		r.notification = choice
+		return r
 	}
-	return &CallbackAnswer{Edit: frozen(ev.SourceText, choice)}
+	r.screen = &Message{Text: ev.SourceText + "\n\n👉 " + choice, Keyboard: [][]Button{}}
+	return r
 }
 
-func frozen(text, choice string) *Message {
-	if choice != "" {
-		text += "\n\n👉 " + choice
-	}
-	return &Message{Text: text, Keyboard: [][]Button{}}
-}
-
-// stale handles a press on a button of an outdated message: the keyboard is
-// removed and the user is told why nothing happened.
-func stale(ev Event) reply {
-	answer := &CallbackAnswer{Notification: textStale}
-	if ev.SourceText != "" {
-		answer.Edit = frozen(ev.SourceText, "")
-	}
-	return reply{answer: answer}
+// stale answers a press on a button that no longer fits the dialog, e.g. a
+// second tap before the screen changed or a button of an old message. The
+// user is told, and the message is left as it is: it may be the current
+// screen already.
+func stale() reply {
+	return reply{notification: textStale}
 }

@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -13,9 +14,20 @@ import (
 // MAX rejects messages longer than 4000 characters; keep a margin for markup.
 const maxMessageRunes = 3500
 
-// Messages with callback buttons are plain text on purpose: when a button is
-// pressed the bot "freezes" the message by re-sending its plain text from the
-// update, and markdown would be lost at that point anyway.
+// MAX allows 30 rows of buttons under a message and 128 characters on a
+// button. The list of results shows at most maxListed cards: the rest are a
+// flip away. A button text is cut at maxButtonRunes, with room for emoji,
+// which may count twice.
+const (
+	maxListed      = 25
+	maxButtonRunes = 100
+)
+
+// A pressed button turns its message into the next screen. The menu and the
+// questions are plain text: a tick in a multi-choice question keeps the text
+// MAX sends with the press, and that text has no markup. The results are
+// markdown, and the links of a card are buttons: MAX gives an edited message
+// a preview of the first link in its text.
 
 const textWelcome = `Привет! Я Навигатор студента 🧭
 
@@ -43,7 +55,10 @@ const (
 	textNothingFound = "По твоим ответам в этом разделе пока ничего не нашлось 🤷 Мы пополняем базу, загляни позже или попробуй другой раздел."
 	textDisclaimer   = "⚠️ Правила иногда меняются: перед походом в инстанцию сверься с официальным источником по ссылке."
 
-	labelMenu        = "⬅️ В меню"
+	labelMenu        = "🏠 В меню"
+	labelBack        = "◀️ Назад"
+	labelNext        = "Далее ▶️"
+	labelList        = "📋 Список"
 	labelProfile     = "👤 Моя анкета"
 	labelAbout       = "ℹ️ О боте"
 	labelDelete      = "🗑 Удалить мои данные"
@@ -109,37 +124,42 @@ func aboutMessage() Message {
 	return Message{Text: textAbout, Keyboard: [][]Button{{{Text: labelMenu, Payload: actMenu}}}}
 }
 
-// questionMessage renders a question. preface is shown above it, e.g. the
-// category intro before the first question.
-func (b *Bot) questionMessage(c *survey.Category, q *survey.Question, pos int, selected []string, preface string) Message {
+// questionMessage renders a question under the title of its category. note
+// goes under the title, e.g. the category intro before the first question.
+// The selected options are ticked: the ones picked in a multi-choice
+// question, or the old answer when the user comes back to a question.
+func (b *Bot) questionMessage(c *survey.Category, q *survey.Question, pos int, selected []string, note string) Message {
 	var sb strings.Builder
-	if preface != "" {
-		sb.WriteString(preface)
-		sb.WriteString("\n\n")
+	sb.WriteString(c.Title)
+	if note != "" {
+		sb.WriteString("\n")
+		sb.WriteString(note)
 	}
-	fmt.Fprintf(&sb, "Вопрос %d из %d\n%s", pos, len(c.Questions), q.Text)
+	fmt.Fprintf(&sb, "\n\nВопрос %d из %d\n%s", pos, len(c.Questions), q.Text)
 	if q.Multi {
 		sb.WriteString("\n\nМожно выбрать несколько вариантов, потом нажми «Готово».")
 	}
 
 	buttons := make([]Button, 0, len(q.Options))
 	for _, o := range q.Options {
+		btn := Button{Text: o.Title, Payload: payload(actAnswer, q.ID, o.ID)}
 		if q.Multi {
-			mark := "▫️ "
-			if slices.Contains(selected, o.ID) {
-				mark = "✅ "
-			}
-			buttons = append(buttons, Button{Text: mark + o.Title, Payload: payload(actToggle, q.ID, o.ID)})
-		} else {
-			buttons = append(buttons, Button{Text: o.Title, Payload: payload(actAnswer, q.ID, o.ID)})
+			btn = Button{Text: "▫️ " + o.Title, Payload: payload(actToggle, q.ID, o.ID)}
 		}
+		if slices.Contains(selected, o.ID) {
+			btn.Text = "✅ " + o.Title
+		}
+		buttons = append(buttons, btn)
 	}
 	kb := layout(buttons)
 	if q.Multi {
 		kb = append(kb, []Button{{Text: labelDone, Payload: payload(actDone, q.ID)}})
 	}
-	kb = append(kb, []Button{{Text: labelMenu, Payload: actMenu}})
-	return Message{Text: sb.String(), Keyboard: kb}
+	nav := []Button{{Text: labelMenu, Payload: actMenu}}
+	if pos > 1 {
+		nav = append([]Button{{Text: labelBack, Payload: payload(actBack, q.ID)}}, nav...)
+	}
+	return Message{Text: sb.String(), Keyboard: append(kb, nav)}
 }
 
 // layout puts short buttons two per row and long ones on their own row, so
@@ -201,7 +221,7 @@ func deleteConfirmMessage() Message {
 		Text: "Удалить все твои ответы и прогресс? Это нельзя отменить.",
 		Keyboard: [][]Button{{
 			{Text: labelDeleteYes, Payload: actDeleteConfirm},
-			{Text: labelCancel, Payload: actMenu},
+			{Text: labelCancel, Payload: actProfile},
 		}},
 	}
 }
@@ -223,33 +243,122 @@ func (b *Bot) summary(qids []string, answers map[string][]string) string {
 	return strings.Join(lines, "\n")
 }
 
-// resultMessages renders the found entries, splitting them into several
-// messages when they do not fit into one, and ends with a "what next" menu.
-func resultMessages(c *survey.Category, entries []knowledge.Entry) []Message {
-	next := Message{
-		Text: textDisclaimer + "\n\nЧто дальше?",
-		Keyboard: [][]Button{
-			{{Text: labelOtherTopics, Payload: actMenu}},
-			{{Text: labelEditAnswers, Payload: payload(actRedo, c.ID)}},
-		},
+// resultsMessage lists the cards found, most important first, as buttons: a
+// card opens in place of the list.
+func resultsMessage(c *survey.Category, entries []knowledge.Entry) Message {
+	next := [][]Button{
+		{{Text: labelOtherTopics, Payload: actMenu}},
+		{{Text: labelEditAnswers, Payload: payload(actRedo, c.ID)}},
 	}
 	if len(entries) == 0 {
-		next.Text = textNothingFound + "\n\nЧто дальше?"
-		return []Message{next}
+		return Message{Text: c.Title + "\n\n" + textNothingFound, Keyboard: next}
 	}
 
-	header := fmt.Sprintf("**%s: подборка для тебя**\nНашёл пунктов: %d. В каждом: что это, как оформить и куда идти.", c.Title, len(entries))
-	blocks := []string{header}
-	for _, e := range entries {
-		blocks = append(blocks, renderEntry(e))
+	found := fmt.Sprintf("Нашёл %d %s, самые важные — сверху. Открой любой: расскажу, что это, как оформить и куда идти.",
+		len(entries), plural(len(entries), "пункт", "пункта", "пунктов"))
+	if len(entries) == 1 {
+		found = "Нашёл 1 пункт. Открой его: расскажу, что это, как оформить и куда идти."
 	}
-	var out []Message
-	for _, text := range pack(blocks, "\n\n", maxMessageRunes) {
-		out = append(out, Message{Text: text, Markdown: true})
+	var kb [][]Button
+	for _, e := range entries[:min(len(entries), maxListed)] {
+		kb = append(kb, []Button{{Text: clip(e.Title), Payload: cardPayload(c, e.ID, 0)}})
 	}
-	return append(out, next)
+	if rest := len(entries) - maxListed; rest > 0 {
+		kb = append(kb, []Button{{
+			Text:    fmt.Sprintf("Ещё %d %s ▶️", rest, plural(rest, "пункт", "пункта", "пунктов")),
+			Payload: cardPayload(c, entries[maxListed].ID, 0),
+		}})
+	}
+	return Message{
+		Text:     fmt.Sprintf("**%s: подборка для тебя**\n%s\n\n%s", c.Title, found, textDisclaimer),
+		Markdown: true,
+		Keyboard: append(kb, next...),
+	}
 }
 
+// page is a screen of a card: a long card takes a few.
+type page struct {
+	entry, part, parts int
+	text               string
+}
+
+// cardPages splits the cards found into screens, in the order they are flipped
+// through.
+func cardPages(entries []knowledge.Entry) []page {
+	var out []page
+	for i, e := range entries {
+		parts := pack([]string{renderEntry(e)}, "\n\n", maxMessageRunes)
+		for j, text := range parts {
+			out = append(out, page{entry: i, part: j, parts: len(parts), text: text})
+		}
+	}
+	return out
+}
+
+// cardMessage shows a part of the card with the given ID, with the card's
+// links and the arrows to the pages around it. ok is false if the card is
+// not among the entries.
+func cardMessage(c *survey.Category, entries []knowledge.Entry, id string, part int) (msg Message, ok bool) {
+	all := cardPages(entries)
+	i := slices.IndexFunc(all, func(p page) bool { return entries[p.entry].ID == id && p.part == part })
+	if i < 0 {
+		return Message{}, false
+	}
+	p := all[i]
+	header := fmt.Sprintf("%s · %d из %d", c.Title, p.entry+1, len(entries))
+	if p.parts > 1 {
+		header += fmt.Sprintf(", часть %d из %d", p.part+1, p.parts)
+	}
+	to := func(pg page) string { return cardPayload(c, entries[pg.entry].ID, pg.part) }
+
+	var nav []Button
+	if i > 0 {
+		nav = append(nav, Button{Text: labelBack, Payload: to(all[i-1])})
+	}
+	nav = append(nav, Button{Text: labelList, Payload: payload(actResults, c.ID)})
+	if i < len(all)-1 {
+		nav = append(nav, Button{Text: labelNext, Payload: to(all[i+1])})
+	}
+	return Message{
+		Text:     header + "\n\n" + p.text,
+		Markdown: true,
+		Keyboard: append(linkButtons(entries[p.entry].Links), nav),
+	}, true
+}
+
+func cardPayload(c *survey.Category, id string, part int) string {
+	return payload(actCard, c.ID, strconv.Itoa(part), id)
+}
+
+// linkButtons puts the links of a card under it, a link a row.
+func linkButtons(links []knowledge.Link) [][]Button {
+	var rows [][]Button
+	for _, l := range links {
+		rows = append(rows, []Button{{Text: clip("🔗 " + l.Title), URL: l.URL}})
+	}
+	return rows
+}
+
+// clip cuts a text from the knowledge base to fit a button.
+func clip(s string) string {
+	if utf8.RuneCountInString(s) <= maxButtonRunes {
+		return s
+	}
+	return string([]rune(s)[:maxButtonRunes-1]) + "…"
+}
+
+// plural picks the form of a noun for n: 1 пункт, 3 пункта, 7 пунктов.
+func plural(n int, one, few, many string) string {
+	switch {
+	case n%10 == 1 && n%100 != 11:
+		return one
+	case n%10 >= 2 && n%10 <= 4 && (n%100 < 12 || n%100 > 14):
+		return few
+	}
+	return many
+}
+
+// renderEntry is the text of a card. Its links are buttons: linkButtons.
 func renderEntry(e knowledge.Entry) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "**%s**\n%s", e.Title, strings.TrimSpace(e.Summary))
@@ -267,13 +376,6 @@ func renderEntry(e knowledge.Entry) string {
 	}
 	if e.Where != "" {
 		fmt.Fprintf(&sb, "\n\n**Куда идти:** %s", strings.TrimSpace(e.Where))
-	}
-	if len(e.Links) > 0 {
-		links := make([]string, 0, len(e.Links))
-		for _, l := range e.Links {
-			links = append(links, fmt.Sprintf("[%s](%s)", l.Title, l.URL))
-		}
-		sb.WriteString("\n\n🔗 " + strings.Join(links, " · "))
 	}
 	return sb.String()
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -63,7 +64,8 @@ entries:
       - {title: "Сайт Б", url: "https://b.example", when: {uni: [b]}}
 `
 
-// chat records everything the bot sends, like a MAX dialog would show it.
+// chat records everything the bot sends, like a MAX dialog would show it: a
+// pressed button's edit changes its message in place.
 type chat struct {
 	mu       sync.Mutex
 	messages []Message
@@ -81,10 +83,15 @@ func (c *chat) Send(_ context.Context, _ int64, msg Message) error {
 	return nil
 }
 
-func (c *chat) AnswerCallback(_ context.Context, _ int64, _ string, a CallbackAnswer) error {
+// AnswerCallback takes the callback ID for the index of the pressed message,
+// the way user.press makes it.
+func (c *chat) AnswerCallback(_ context.Context, _ int64, id string, a CallbackAnswer) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.answers = append(c.answers, a)
+	if i, err := strconv.Atoi(id); err == nil && a.Edit != nil && i < len(c.messages) {
+		c.messages[i] = *a.Edit
+	}
 	return nil
 }
 
@@ -142,11 +149,21 @@ func (u *user) say(text string) { u.handle(Event{Type: EventText, Text: text}) }
 // keyboard, the way a user would.
 func (u *user) press(text string) {
 	u.t.Helper()
-	msg, btn := u.find(text)
-	u.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: btn.Payload, SourceText: msg.Text})
+	u.pressOn(u.find(text))
 }
 
-func (u *user) find(text string) (Message, Button) {
+// pressOn taps a button on the i-th message of the chat.
+func (u *user) pressOn(i int, btn Button) {
+	u.t.Helper()
+	u.chat.mu.Lock()
+	source := u.chat.messages[i].Text
+	u.chat.mu.Unlock()
+	u.handle(Event{Type: EventCallback, CallbackID: strconv.Itoa(i), Payload: btn.Payload, SourceText: source})
+}
+
+// find returns the index of the latest message with a keyboard and its
+// button with the given text.
+func (u *user) find(text string) (int, Button) {
 	u.t.Helper()
 	u.chat.mu.Lock()
 	defer u.chat.mu.Unlock()
@@ -158,14 +175,14 @@ func (u *user) find(text string) (Message, Button) {
 		for _, row := range msg.Keyboard {
 			for _, b := range row {
 				if strings.Contains(b.Text, text) {
-					return msg, b
+					return i, b
 				}
 			}
 		}
 		u.t.Fatalf("no button %q in the latest keyboard:\n%s", text, msg.Text)
 	}
 	u.t.Fatalf("no keyboard sent yet")
-	return Message{}, Button{}
+	return 0, Button{}
 }
 
 func (u *user) session() *session.Session {
@@ -176,12 +193,63 @@ func (u *user) session() *session.Session {
 	return s
 }
 
+// allText is what the chat shows: the messages and their buttons.
 func (u *user) allText() string {
 	var sb strings.Builder
 	for _, m := range u.chat.messages {
 		sb.WriteString(m.Text + "\n")
+		for _, row := range m.Keyboard {
+			for _, b := range row {
+				sb.WriteString(b.Text)
+				sb.WriteString("\n")
+			}
+		}
 	}
 	return sb.String()
+}
+
+// readResults opens every card of the results on the last message, as a
+// curious student would, and returns what they read: the list, the cards
+// and the addresses of their links.
+func (u *user) readResults() string {
+	u.t.Helper()
+	i := len(u.chat.messages) - 1
+	list := u.chat.last()
+	var sb strings.Builder
+	sb.WriteString(list.Text)
+	for _, row := range list.Keyboard {
+		btn := row[0]
+		if !strings.HasPrefix(btn.Payload, actCard+":") {
+			continue
+		}
+		u.pressOn(i, btn)
+		card := u.chat.last()
+		sb.WriteString("\n")
+		sb.WriteString(card.Text)
+		for _, row := range card.Keyboard {
+			for _, b := range row {
+				if b.URL != "" {
+					sb.WriteString("\n")
+					sb.WriteString(b.URL)
+				}
+			}
+		}
+		u.press(labelList)
+	}
+	return sb.String()
+}
+
+// buttons lists the texts of the buttons of the last message, row by row.
+func (u *user) buttons() [][]string {
+	var rows [][]string
+	for _, row := range u.chat.last().Keyboard {
+		var texts []string
+		for _, b := range row {
+			texts = append(texts, b.Text)
+		}
+		rows = append(rows, texts)
+	}
+	return rows
 }
 
 func TestSurveyFlowToResults(t *testing.T) {
@@ -192,23 +260,22 @@ func TestSurveyFlowToResults(t *testing.T) {
 	}
 
 	u.press("Деньги")
-	if got := u.chat.lastAnswer().Edit.Text; !strings.HasSuffix(got, "👉 Деньги") {
-		t.Errorf("menu message is not frozen with the choice: %q", got)
-	}
-	if q := u.chat.last().Text; !strings.Contains(q, "Пара вопросов.") || !strings.Contains(q, "Вопрос 1 из 2") {
-		t.Errorf("first question should have the intro and position: %q", q)
+	if q := u.chat.last().Text; !strings.Contains(q, "Деньги\nПара вопросов.") || !strings.Contains(q, "Вопрос 1 из 2") {
+		t.Errorf("first question should have the title, the intro and the position: %q", q)
 	}
 
 	u.press("Вуз А")
 	if s := u.session(); !slices.Equal(s.Answers["uni"], []string{"a"}) || s.State != session.StateSurvey {
 		t.Fatalf("answer not saved: %+v", s)
 	}
+	if q := u.chat.last().Text; !strings.HasPrefix(q, "Деньги\n\nВопрос 2 из 2") {
+		t.Errorf("the next question should go under the title, without the intro: %q", q)
+	}
 
-	// Multi-choice: toggling edits the question in place.
+	// Multi-choice: toggling ticks the option.
 	u.press("Сирота")
-	edit := u.chat.lastAnswer().Edit
-	if edit == nil || !strings.Contains(edit.Keyboard[0][0].Text, "✅") {
-		t.Fatalf("toggle should re-render the question with a check mark: %+v", edit)
+	if got := u.buttons()[0][0]; got != "✅ Сирота" {
+		t.Fatalf("toggle should re-render the question with a check mark: %q", got)
 	}
 	u.press("Мало денег")
 	u.press("Готово")
@@ -216,16 +283,140 @@ func TestSurveyFlowToResults(t *testing.T) {
 	if s := u.session(); s.State != session.StateMenu || !slices.Equal(s.Answers["status"], []string{"orphan", "poor"}) {
 		t.Fatalf("unexpected session after the last answer: %+v", s)
 	}
-	text := u.allText()
-	// Higher priority first, university-specific link only for university A.
-	if i, j := strings.Index(text, "Для сирот"), strings.Index(text, "Для всех"); i < 0 || j < 0 || i > j {
-		t.Errorf("expected both entries, orphans first:\n%s", text)
+	list := u.chat.last()
+	if !list.Markdown || !strings.Contains(list.Text, "**Деньги: подборка для тебя**\nНашёл 2 пункта") ||
+		!strings.Contains(list.Text, textDisclaimer) {
+		t.Errorf("results list:\n%s", list.Text)
 	}
-	if !strings.Contains(text, "[Сайт А](https://a.example)") || strings.Contains(text, "b.example") {
-		t.Errorf("links are not filtered by university:\n%s", text)
+	// Higher priority first, then what to do next.
+	want := [][]string{{"Для сирот"}, {"Для всех"}, {labelOtherTopics}, {labelEditAnswers}}
+	if got := u.buttons(); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("results buttons %q, want %q", got, want)
 	}
-	if last := u.chat.last(); !strings.Contains(last.Text, "Что дальше?") {
-		t.Errorf("results must end with the next-steps menu: %q", last.Text)
+}
+
+// Every press changes the message with the button, so the whole dialog
+// takes one message.
+func TestButtonsChangeTheirMessage(t *testing.T) {
+	u := newUser(t)
+	u.start()
+	for _, btn := range []string{"Деньги", "Вуз А", "Сирота", "Готово", "Для сирот", "Далее", "Назад", "Список",
+		"Другие разделы", "Моя анкета", "Удалить мои данные", "Отмена", "В меню", "О боте", "В меню"} {
+		u.press(btn)
+	}
+	if n := len(u.chat.messages); n != 1 {
+		t.Fatalf("the buttons must change their message, got %d messages:\n%s", n, u.allText())
+	}
+	if got := u.chat.last().Text; got != textMenu {
+		t.Errorf("the message ends as the menu: %q", got)
+	}
+}
+
+// The results are a list of the cards, and every card is a screen of its own
+// with its links as buttons and the arrows to the others.
+func TestResultsAreFlippedThrough(t *testing.T) {
+	u := newUser(t)
+	u.start()
+	u.press("Деньги")
+	u.press("Вуз А")
+	u.press("Сирота")
+	u.press("Готово")
+
+	u.press("Для сирот")
+	card := u.chat.last()
+	if !card.Markdown || !strings.HasPrefix(card.Text, "Деньги · 1 из 2\n\n**Для сирот**\nСиротам.") {
+		t.Errorf("the first card:\n%s", card.Text)
+	}
+	// An edited message gets a preview of the first link in its text, so the
+	// links are buttons, filtered by the university.
+	if strings.Contains(card.Text, "https://") {
+		t.Errorf("a card must have no links in its text:\n%s", card.Text)
+	}
+	link := card.Keyboard[0][0]
+	if link.Text != "🔗 Сайт А" || link.URL != "https://a.example" || len(card.Keyboard) != 2 {
+		t.Errorf("the links of the card: %+v", card.Keyboard)
+	}
+	if got := u.buttons()[1]; !slices.Equal(got, []string{labelList, labelNext}) {
+		t.Errorf("the first card has no way back but to the list: %q", got)
+	}
+
+	u.press("Далее")
+	if got := u.chat.last().Text; !strings.HasPrefix(got, "Деньги · 2 из 2\n\n**Для всех**") {
+		t.Errorf("the second card:\n%s", got)
+	}
+	if got := u.buttons(); !slices.EqualFunc(got, [][]string{{labelBack, labelList}}, slices.Equal) {
+		t.Errorf("the last card has no way further: %q", got)
+	}
+	u.press("Назад")
+	if got := u.chat.last().Text; !strings.Contains(got, "**Для сирот**") {
+		t.Errorf("back to the first card:\n%s", got)
+	}
+	u.press("Список")
+	if got := u.chat.last().Text; !strings.Contains(got, "подборка для тебя") {
+		t.Errorf("back to the list:\n%s", got)
+	}
+	if s := u.session(); s.State != session.StateMenu {
+		t.Errorf("reading the cards changes nothing: %+v", s)
+	}
+}
+
+// A card that left the results since they were shown opens the list, and
+// results of a category with answers missing open its questions.
+func TestOutdatedResults(t *testing.T) {
+	u := newUser(t)
+	u.start()
+	u.press("Деньги")
+	u.press("Вуз А")
+	u.press("Ничего")
+	u.press("Готово")
+
+	u.handle(Event{Type: EventCallback, CallbackID: "0", Payload: payload(actCard, "money", "0", "for_orphans"), SourceText: "список"})
+	if got := u.chat.last().Text; !strings.Contains(got, "Нашёл 1 пункт.") {
+		t.Errorf("a card that is not for the user shows the list:\n%s", got)
+	}
+
+	u.press("Изменить анкету")
+	u.handle(Event{Type: EventCallback, CallbackID: "0", Payload: payload(actResults, "money"), SourceText: "список"})
+	if got := u.chat.last().Text; !strings.Contains(got, "Вопрос 1 из 2") {
+		t.Errorf("results without the answers ask the questions:\n%s", got)
+	}
+}
+
+// Going back forgets the previous answer and asks the question again, with
+// the old answer ticked.
+func TestBackToPreviousQuestion(t *testing.T) {
+	u := newUser(t)
+	u.start()
+	u.press("Деньги")
+	if slices.ContainsFunc(u.buttons(), func(row []string) bool { return slices.Contains(row, labelBack) }) {
+		t.Error("the first question has nothing to go back to")
+	}
+	u.press("Вуз А")
+	u.press("Сирота")
+	u.press("Назад")
+
+	if got := u.chat.last().Text; !strings.Contains(got, "Вопрос 1 из 2\nГде учишься?") {
+		t.Fatalf("back to the first question:\n%s", got)
+	}
+	if got := u.buttons()[0]; !slices.Equal(got, []string{"✅ Вуз А", "Вуз Б"}) {
+		t.Errorf("the old answer must be ticked: %q", got)
+	}
+	if s := u.session(); len(s.Answers["uni"]) != 0 || s.State != session.StateSurvey {
+		t.Fatalf("the answer must be open again: %+v", s)
+	}
+
+	u.press("Вуз Б")
+	if s := u.session(); !slices.Equal(s.Answers["uni"], []string{"b"}) || len(s.Selected) != 0 {
+		t.Fatalf("the new answer must be saved: %+v", s)
+	}
+	if got := u.chat.last().Text; !strings.Contains(got, "Вопрос 2 из 2") {
+		t.Errorf("then the next question again:\n%s", got)
+	}
+
+	// A stale back from the first question changes nothing.
+	u.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: payload(actBack, "uni"), SourceText: "вопрос"})
+	if s := u.session(); !slices.Equal(s.Answers["uni"], []string{"b"}) || u.chat.lastAnswer().Notification != textStale {
+		t.Errorf("a stale back: %+v", s)
 	}
 }
 
@@ -276,8 +467,29 @@ func TestProgressIsResumedAndSharedBetweenCategories(t *testing.T) {
 	// Back to the first category: resumes from the status question.
 	u.press("Другие разделы")
 	u.press("Деньги")
-	if q := u.chat.last().Text; !strings.Contains(q, "продолжаем с вопроса 2") || !strings.Contains(q, "Что про тебя?") {
-		t.Fatalf("should resume the first category: %q", q)
+	resumed := u.chat.last().Text
+	if !strings.Contains(resumed, "продолжаем с вопроса 2") || !strings.Contains(resumed, "Что про тебя?") {
+		t.Fatalf("should resume the first category: %q", resumed)
+	}
+	// A tick changes the buttons only: the text keeps the note, and the
+	// buttons do not jump under the finger.
+	u.press("Сирота")
+	if got := u.chat.last().Text; got != resumed {
+		t.Errorf("a tick changed the text to\n%s", got)
+	}
+}
+
+// A press on a message deleted meanwhile gets the next screen as a new
+// message.
+func TestPressOnDeletedMessage(t *testing.T) {
+	u := newUser(t)
+	u.start()
+	u.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: payload(actCategory, "money")})
+	if n := len(u.chat.messages); n != 2 || !strings.Contains(u.chat.last().Text, "Вопрос 1 из 2") {
+		t.Fatalf("the question must come as a new message:\n%s", u.allText())
+	}
+	if a := u.chat.lastAnswer(); a.Edit != nil || a.Notification == "" {
+		t.Errorf("the press must still be acknowledged: %+v", a)
 	}
 }
 
@@ -298,10 +510,9 @@ func TestFilledCategoryOffersReuseOrRedo(t *testing.T) {
 		t.Errorf("confirm should summarize the saved answers: %q", msg)
 	}
 
-	n := len(u.chat.messages)
 	u.press("Показать подборку")
-	if len(u.chat.messages) <= n || !strings.Contains(u.allText(), "Для всех") {
-		t.Fatalf("reuse should show results")
+	if !u.hasButton("Для всех") {
+		t.Fatalf("reuse should show results:\n%s", u.chat.last().Text)
 	}
 
 	u.press("Изменить анкету")
@@ -318,17 +529,22 @@ func TestStaleButtonIsRejected(t *testing.T) {
 	u := newUser(t)
 	u.start()
 	u.press("Деньги")
-	oldQuestion, _ := u.find("Вуз А")
+	i, _ := u.find("Вуз А")
+	oldQuestion := u.chat.messages[i].Text
 	u.press("Вуз А")
 
-	// Tapping the already answered question again must not overwrite anything.
-	u.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: payload(actAnswer, "uni", "b"), SourceText: oldQuestion.Text})
-	a := u.chat.lastAnswer()
-	if a.Notification != textStale || a.Edit == nil || len(a.Edit.Keyboard) != 0 {
-		t.Fatalf("stale press should remove the keyboard and notify: %+v", a)
+	// A second tap on the answered question, e.g. before the screen changed,
+	// must not overwrite anything, nor take away the buttons of the message:
+	// it shows the next question already.
+	u.handle(Event{Type: EventCallback, CallbackID: "0", Payload: payload(actAnswer, "uni", "b"), SourceText: oldQuestion})
+	if a := u.chat.lastAnswer(); a.Notification != textStale || a.Edit != nil {
+		t.Fatalf("stale press should only notify: %+v", a)
 	}
 	if s := u.session(); !slices.Equal(s.Answers["uni"], []string{"a"}) {
 		t.Fatalf("stale press changed the answer: %v", s.Answers["uni"])
+	}
+	if !u.hasButton("Готово") {
+		t.Fatalf("the next question must keep its buttons:\n%s", u.chat.last().Text)
 	}
 
 	u.handle(Event{Type: EventCallback, CallbackID: "cb", Payload: "garbage:::"})
@@ -395,9 +611,9 @@ func TestAnswersSurviveKnowledgeBaseFailure(t *testing.T) {
 	u.press("Досуг")
 	u.press("Вуз А")
 
-	msg, btn := u.find("Спорт")
-	err = u.bot.Handle(context.Background(), Event{Type: EventCallback, UserID: u.id, CallbackID: "cb", Payload: btn.Payload, SourceText: msg.Text})
-	if err == nil {
+	i, btn := u.find("Спорт")
+	ev := Event{Type: EventCallback, UserID: u.id, CallbackID: strconv.Itoa(i), Payload: btn.Payload, SourceText: u.chat.messages[i].Text}
+	if err := u.bot.Handle(context.Background(), ev); err == nil {
 		t.Fatal("expected the knowledge base error to be reported")
 	}
 	if s := u.session(); !slices.Equal(s.Answers["hobby"], []string{"sport"}) {
