@@ -22,6 +22,9 @@ type Source struct {
 	// Published is zero when the page doesn't tell its date.
 	Published time.Time
 	PDF       bool
+	// Snippets means the page could not be read, and Text is its search
+	// snippets.
+	Snippets bool
 }
 
 // proposal is a card the model suggested.
