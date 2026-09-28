@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,7 +12,8 @@ import (
 	"github.com/KKolyasik/max-benefits/internal/session"
 )
 
-// slowMessenger imitates the network: every call to MAX takes some time.
+// slowMessenger imitates the network: every call to MAX takes some time. It
+// keeps the screen each user sees last.
 type slowMessenger struct {
 	delay time.Duration
 	mu    sync.Mutex
@@ -26,8 +28,13 @@ func (m *slowMessenger) Send(_ context.Context, userID int64, msg Message) error
 	return nil
 }
 
-func (m *slowMessenger) AnswerCallback(context.Context, int64, string, CallbackAnswer) error {
+func (m *slowMessenger) AnswerCallback(_ context.Context, userID int64, _ string, a CallbackAnswer) error {
 	time.Sleep(m.delay)
+	if a.Edit != nil {
+		m.mu.Lock()
+		m.last[userID] = *a.Edit
+		m.mu.Unlock()
+	}
 	return nil
 }
 
@@ -74,15 +81,15 @@ func TestPeakLoad(t *testing.T) {
 	}
 	for _, p := range script {
 		for id := int64(1); id <= users; id++ {
-			pool.Submit(context.Background(), Event{Type: EventCallback, UserID: id, CallbackID: "cb", Payload: p})
+			pool.Submit(context.Background(), Event{Type: EventCallback, UserID: id, CallbackID: "cb", Payload: p, SourceText: "экран"})
 		}
 	}
 	pool.Close()
 	total := time.Since(start)
 
 	for id := int64(1); id <= users; id++ {
-		if msg := out.last[id]; msg.Text == "" || msg.Keyboard == nil || msg.Keyboard[0][0].Payload != actMenu {
-			t.Fatalf("user %d did not get the results, last message: %q", id, msg.Text)
+		if msg := out.last[id]; !strings.Contains(msg.Text, "подборка для тебя") {
+			t.Fatalf("user %d did not get the results, last screen: %q", id, msg.Text)
 		}
 	}
 	t.Logf("%d users × %d steps in %v, slowest step %v", users, len(script)+1, total, slowest)

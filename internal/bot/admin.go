@@ -147,26 +147,25 @@ func agentMessage() Message {
 // onAdmin handles the admin buttons. For anyone else they are stale.
 func (b *Bot) onAdmin(ctx context.Context, ev Event, action, arg string) (reply, error) {
 	if !b.isAdmin(ev.UserID) {
-		return stale(ev), nil
+		return stale(), nil
 	}
 	switch action {
 	case actDrafts:
 		r, err := b.nextDraft(ctx, 0)
-		r.answer = freeze(ev, labelDrafts)
-		return r, err
+		return freeze(ev, labelDrafts, r), err
 	case actAgent, actRun:
 		if b.agent == nil {
-			return stale(ev), nil
+			return stale(), nil
 		}
 		if action == actAgent {
-			return reply{answer: freeze(ev, labelAgent), messages: []Message{agentMessage()}}, nil
+			return show(agentMessage()), nil
 		}
-		return b.runAgent(ctx, ev, arg == "force"), nil
+		return show(b.runAgent(ctx, ev.UserID, arg == "force")), nil
 	}
 
 	id, err := strconv.ParseInt(arg, 10, 64)
 	if err != nil {
-		return stale(ev), nil
+		return stale(), nil
 	}
 	var choice string
 	switch action {
@@ -183,7 +182,7 @@ func (b *Bot) onAdmin(ctx context.Context, ev Event, action, arg string) (reply,
 	case actSkip:
 		choice = textSkipped
 	default:
-		return stale(ev), nil
+		return stale(), nil
 	}
 
 	var invalid *moderation.InvalidError
@@ -192,16 +191,14 @@ func (b *Bot) onAdmin(ctx context.Context, ev Event, action, arg string) (reply,
 		// The base or the survey changed since the draft was shown: show it
 		// again with the reasons.
 		r, err := b.nextDraft(ctx, id-1)
-		r.answer = freeze(ev, textCantApprove)
-		return r, err
+		return freeze(ev, textCantApprove, r), err
 	case errors.Is(err, moderation.ErrDecided), errors.Is(err, moderation.ErrNotFound):
 		choice = textDecided
 	case err != nil:
 		return reply{}, err
 	}
 	r, err := b.nextDraft(ctx, id)
-	r.answer = freeze(ev, choice)
-	return r, err
+	return freeze(ev, choice, r), err
 }
 
 // nextDraft shows the oldest pending draft after the given ID: the card the
@@ -238,7 +235,8 @@ func (b *Bot) nextDraft(ctx context.Context, after int64) (reply, error) {
 	problems := moderation.Problems(d, b.survey, current)
 
 	var messages []Message
-	preview := []string{"👀 **Так карточку увидят студенты:**", renderEntry(d.Card.Preview())}
+	card := d.Card.Preview()
+	preview := []string{"👀 **Так карточку увидят студенты:**", renderEntry(card)}
 	// The sources go here, not next to the buttons: a pressed button edits
 	// its message, and MAX edits a message only with a preview of its first
 	// link.
@@ -248,11 +246,14 @@ func (b *Bot) nextDraft(ctx context.Context, after int64) (reply, error) {
 	for _, text := range pack(preview, "\n\n", maxMessageRunes) {
 		messages = append(messages, Message{Text: text, Markdown: true})
 	}
+	// Students get the links of the card as buttons under it.
+	messages[len(messages)-1].Keyboard = linkButtons(card.Links)
 	return reply{messages: append(messages, b.draftControls(d, current, problems, pending))}, nil
 }
 
-// draftControls is plain text, like every message with buttons: it is frozen
-// with the admin's decision when a button is pressed.
+// draftControls is plain text: it is frozen with the admin's decision when a
+// button is pressed, from the text MAX sends with the press, which has no
+// markup.
 func (b *Bot) draftControls(d moderation.Draft, current *knowledge.Card, problems []string, pending int) Message {
 	var sb strings.Builder
 	if current != nil {
@@ -360,18 +361,14 @@ var linkTarget = strings.NewReplacer("(", "%28", ")", "%29", " ", "%20").Replace
 
 // runAgent passes the command to the agent. The agent answers later, when
 // it starts: NotifyRun.
-func (b *Bot) runAgent(ctx context.Context, ev Event, force bool) reply {
-	choice := labelRun
-	if force {
-		choice = labelRunForce
-	}
+func (b *Bot) runAgent(ctx context.Context, admin int64, force bool) Message {
 	back := [][]Button{{{Text: labelMenu, Payload: actMenu}}}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := b.agent.RunAgent(ctx, force); err != nil {
-		b.log.Error("run the agent", "admin", ev.UserID, "err", err)
-		return reply{answer: freeze(ev, choice), messages: []Message{{Text: textAgentDown, Keyboard: back}}}
+		b.log.Error("run the agent", "admin", admin, "err", err)
+		return Message{Text: textAgentDown, Keyboard: back}
 	}
-	b.log.Info("the agent is asked to run", "admin", ev.UserID, "force", force)
-	return reply{answer: freeze(ev, choice), messages: []Message{{Text: textAgentSent, Keyboard: back}}}
+	b.log.Info("the agent is asked to run", "admin", admin, "force", force)
+	return Message{Text: textAgentSent, Keyboard: back}
 }

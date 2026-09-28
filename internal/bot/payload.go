@@ -16,6 +16,12 @@ const (
 	actAnswer        = "ans"  // ans:<question>:<option>, single choice
 	actToggle        = "tgl"  // tgl:<question>:<option>, multi choice
 	actDone          = "done" // done:<question>, confirms a multi choice
+	actBack          = "back" // back:<question>, back to the question before
+	actResults       = "res"  // res:<category>, the list of the cards found
+	// card:<category>:<part>:<card> is a card of the results. The card ID
+	// goes last: cards come from the agent too, and nothing keeps ':' out
+	// of their IDs.
+	actCard = "card"
 
 	// Admin actions; the bot checks the rights on every press.
 	actDrafts  = "adm"      // shows the oldest pending draft
