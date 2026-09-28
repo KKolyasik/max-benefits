@@ -47,3 +47,18 @@ func TestKafkaConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestAdminForAllConfig(t *testing.T) {
+	for value, want := range map[string]bool{"": false, "false": false, "true": true, "1": true} {
+		t.Setenv("MAX_BOT_TOKEN", "token")
+		t.Setenv("ADMIN_FOR_ALL", value)
+		cfg, err := loadConfig()
+		if err != nil || cfg.AdminForAll != want {
+			t.Errorf("ADMIN_FOR_ALL=%q: got %v, %v", value, cfg.AdminForAll, err)
+		}
+	}
+	t.Setenv("ADMIN_FOR_ALL", "yes please")
+	if _, err := loadConfig(); err == nil {
+		t.Error("a value that is not a boolean must be rejected")
+	}
+}

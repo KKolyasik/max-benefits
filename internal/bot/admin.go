@@ -36,8 +36,16 @@ func (b *Bot) WithModeration(mod Moderation, admins []int64) *Bot {
 	return b
 }
 
+// WithAdminForAll makes everyone an admin, whoever is in the list of
+// WithModeration: for the time reviewers try the bot. The reports of the agent
+// still go only to the listed admins: the bot has no list of everyone.
+func (b *Bot) WithAdminForAll() *Bot {
+	b.adminForAll = true
+	return b
+}
+
 func (b *Bot) isAdmin(userID int64) bool {
-	return b.mod != nil && b.admins[userID]
+	return b.mod != nil && (b.adminForAll || b.admins[userID])
 }
 
 // Agent is the agent that drafts the cards.

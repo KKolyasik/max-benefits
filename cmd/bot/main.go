@@ -59,6 +59,9 @@ type config struct {
 	// PostgreSQL, where admins publish the agent's drafts.
 	DatabaseURL string
 	AdminIDs    []int64
+	// AdminForAll gives the admin screens to every user, for the time
+	// reviewers try the bot.
+	AdminForAll bool
 	// KafkaBrokers and SchemaRegistryURL connect the bot to the agent: it
 	// takes the drafts and publishes the cards and the admins' decisions.
 	KafkaBrokers      []string
@@ -132,6 +135,10 @@ func run() error {
 	b := bot.New(sv, kb, store, client, log)
 	if cards != nil {
 		b.WithModeration(cards, cfg.AdminIDs)
+		if cfg.AdminForAll {
+			b.WithAdminForAll()
+			log.Warn("ADMIN_FOR_ALL is on: every user can review drafts and run the agent; turn it off when the review is over")
+		}
 		if len(cfg.KafkaBrokers) > 0 {
 			// Stopped before the database closes: the bus works with it.
 			busCtx, stopBus := context.WithCancel(ctx)
@@ -280,6 +287,11 @@ func loadConfig() (config, error) {
 	if cfg.AdminIDs, err = parseIDs(os.Getenv("ADMIN_IDS")); err != nil {
 		errs = append(errs, fmt.Errorf("ADMIN_IDS: %w", err))
 	}
+	if v := os.Getenv("ADMIN_FOR_ALL"); v != "" {
+		if cfg.AdminForAll, err = strconv.ParseBool(v); err != nil {
+			errs = append(errs, fmt.Errorf("ADMIN_FOR_ALL must be true or false, got %q", v))
+		}
+	}
 	switch {
 	case (len(cfg.KafkaBrokers) > 0) != (cfg.SchemaRegistryURL != ""):
 		errs = append(errs, errors.New("KAFKA_BROKERS and SCHEMA_REGISTRY_URL go together: set both or neither"))
@@ -324,7 +336,7 @@ func openCards(ctx context.Context, db *pgxpool.Pool, sv *survey.Survey, static 
 	for id, errs := range broken {
 		log.Warn("card doesn't match the survey and is hidden", "card", id, "err", errors.Join(errs...))
 	}
-	if len(cfg.AdminIDs) == 0 {
+	if len(cfg.AdminIDs) == 0 && !cfg.AdminForAll {
 		log.Warn("ADMIN_IDS is not set: nobody can review drafts")
 	}
 	return cards, nil
