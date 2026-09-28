@@ -92,8 +92,58 @@ services:
     depends_on:
       schema-registry:
         condition: service_healthy
+      # With the ollama profile the agent waits for the model to download.
+      ollama-pull:
+        condition: service_completed_successfully
+        required: false
     # Lets a run that is cut short report to the admins.
     stop_grace_period: 30s
+    logging: *logging
+
+  # The agent's own model, for runs without a Yandex key. Only started on
+  # request, together with the agent:
+  #   docker compose --profile agent --profile ollama up -d --build
+  # and LLM_BASE_URL=http://ollama:11434/v1, LLM_MODEL=qwen3:14b in .env.
+  # In Docker on a Mac the model runs on the CPU, slowly; for a video card
+  # on Linux (NVIDIA container toolkit) uncomment the deploy block.
+  ollama:
+    image: ollama/ollama:0.34.4
+    profiles: [ollama]
+    restart: unless-stopped
+    environment:
+      # The pages in the prompt take 10-12 thousand tokens; with the default
+      # context of 4096 Ollama would cut them silently.
+      OLLAMA_CONTEXT_LENGTH: 32768
+      OLLAMA_FLASH_ATTENTION: 1
+      OLLAMA_KV_CACHE_TYPE: q8_0
+    ports:
+      - 127.0.0.1:11434:11434
+    volumes:
+      - ollama-data:/root/.ollama
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+
+  # Downloads the model once and exits; the volume keeps it.
+  ollama-pull:
+    image: ollama/ollama:0.34.4
+    profiles: [ollama]
+    environment:
+      OLLAMA_HOST: ollama:11434
+    command: ["pull", "${LLM_MODEL:-qwen3:14b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
     logging: *logging
 
   # Free metasearch for the agent when there is no Yandex Search API key.
@@ -171,3 +221,4 @@ volumes:
   postgres-data:
   kafka-data:
   agent-data:
+  ollama-data:
