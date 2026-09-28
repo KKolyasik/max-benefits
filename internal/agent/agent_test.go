@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -73,6 +74,17 @@ func (f *fakeSearch) Search(context.Context, string, int) ([]search.Result, erro
 	defer f.mu.Unlock()
 	f.calls++
 	return f.results, f.err
+}
+
+// pagesFetch reads the pages from the map; a page not in it can't be read.
+type pagesFetch map[string]string
+
+func (f pagesFetch) Fetch(_ context.Context, url, _ string) (fetch.Page, error) {
+	text, ok := f[url]
+	if !ok {
+		return fetch.Page{}, errors.New("timeout")
+	}
+	return fetch.Page{Text: text}, nil
 }
 
 type fakeFetch struct{ text string }
@@ -322,6 +334,116 @@ func TestUnknownLinksAreDropped(t *testing.T) {
 	}
 }
 
+// Only news sends a query to the model: a changed page or a new one. A site
+// that is down this time and search results in another order are no news.
+func TestOnlyNewsGoesToTheModel(t *testing.T) {
+	model := &fakeModel{answers: make([][]map[string]any, 10)}
+	c := newCollector(t, model)
+	const a, b, newer, down = "https://a.example/1", "https://b.example/2", "https://c.example/3", "https://d.example/4"
+	result := func(url string) search.Result {
+		return search.Result{URL: url, Snippets: []string{"фрагмент " + url}}
+	}
+	s := &fakeSearch{results: []search.Result{result(a), result(b)}}
+	pages := pagesFetch{a: "Стипендия 5000 рублей.", b: "Проездной 500 рублей."}
+	c.Search, c.Fetch = s, pages
+	step := func(what string, toModel bool) {
+		t.Helper()
+		calls := len(model.prompts)
+		if _, err := c.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(model.prompts) > calls; got != toModel {
+			t.Errorf("%s: to the model %v, want %v", what, got, toModel)
+		}
+	}
+
+	step("the first run", true)
+	step("the same pages", false)
+	s.results = []search.Result{result(b), result(a)}
+	step("another order", false)
+	delete(pages, a)
+	step("a site that is down", false)
+	pages[a] = "Стипендия 5000 рублей."
+	step("the site is back with the same page", false)
+	pages[b] = "Проездной 600 рублей."
+	step("a changed page", true)
+	s.results = append(s.results, result(newer))
+	pages[newer] = "Новая стипендия."
+	step("a new page", true)
+	s.results = append(s.results, result(down))
+	step("a new page that doesn't open", true)
+	step("the same page that doesn't open", false)
+	pages[down] = "Наконец открылась."
+	step("the page opened for the first time", true)
+}
+
+// A counter of views after the date of a news page is no news; what the
+// page says, the date and the time included, is.
+func TestPageDigest(t *testing.T) {
+	const page = "Стипендии выросли\n\n15 сентября 2026, 08:00 26 745\n\nРазмер: 5 000 рублей."
+	for _, same := range []string{
+		"Стипендии выросли\n\n15 сентября 2026, 08:00 26 747\n\nРазмер: 5 000 рублей.",
+		"Стипендии выросли\n\n15 сентября 2026, 08:00 27 001\n\nРазмер: 5 000 рублей.",
+	} {
+		if pageDigest(same) != pageDigest(page) {
+			t.Errorf("only the counter changed:\n%s", same)
+		}
+	}
+	for _, other := range []string{
+		"Стипендии выросли\n\n15 сентября 2026, 08:00 26 745\n\nРазмер: 7 000 рублей.",
+		"Стипендии выросли\n\n15 сентября 2026, 09:30 26 745\n\nРазмер: 5 000 рублей.",
+		"Стипендии выросли\n\n16 сентября 2026, 08:00 26 745\n\nРазмер: 5 000 рублей.",
+	} {
+		if pageDigest(other) == pageDigest(page) {
+			t.Errorf("the page changed:\n%s", other)
+		}
+	}
+	// A number on a line of its own after the date is not a counter to drop.
+	if pageDigest("28.09.2026 08:00 12\n7 000") == pageDigest("28.09.2026 08:00 15\n5 000") {
+		t.Error("the sum on the next line changed")
+	}
+}
+
+// The state file of the former format still reads: a query whose pages are
+// the same as then does without the model, and moves to the new format on
+// its run.
+func TestFormerStateFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seen.json")
+	same := []Source{{URL: pageURL, Text: "Стипендия 5000 рублей."}}
+	data, err := json.Marshal(map[string]string{"стипендия": legacyDigest(same), "проездной": "0a1b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Changed("стипендия", same)) != 0 || len(s.Changed("проездной", same)) == 0 {
+		t.Fatal("the former digests must count")
+	}
+	if err := s.Remember("стипендия", same); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]json.RawMessage
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if string(saved["проездной"]) != `"0a1b"` || !strings.HasPrefix(string(saved["стипендия"]), "{") {
+		t.Errorf("saved:\n%s", data)
+	}
+	again, err := LoadState(path)
+	if err != nil || len(again.Changed("стипендия", same)) != 0 || len(again.Changed("проездной", same)) == 0 {
+		t.Errorf("after a reload: %v", err)
+	}
+}
+
 // Queries the token limit leaves out wait for the next run: they are not
 // marked as seen, and their search isn't paid for.
 func TestTokenLimitDefersQueries(t *testing.T) {
@@ -334,7 +456,8 @@ func TestTokenLimitDefersQueries(t *testing.T) {
 	if err != nil || r.Deferred != 1 || len(r.Drafts) != 1 || s.calls != 1 {
 		t.Fatalf("report %+v, err %v, searches %d", r, err, s.calls)
 	}
-	if c.State.Seen("первый") == "" || c.State.Seen("второй") != "" {
+	pages := []Source{{URL: pageURL, Text: "Стипендия 5000 рублей."}}
+	if len(c.State.Changed("первый", pages)) != 0 || len(c.State.Changed("второй", pages)) == 0 {
 		t.Error("only the finished query is seen")
 	}
 }
@@ -369,8 +492,9 @@ func TestParallelQueries(t *testing.T) {
 	if err != nil || r.Queries != 6 || len(r.Drafts) != 6 || len(drafts(t, c)) != 6 || r.InputTokens != 6_000_000 {
 		t.Fatalf("report %+v, err %v", r, err)
 	}
+	pages := []Source{{URL: pageURL, Text: "Стипендия 5000 рублей."}}
 	for _, q := range queries {
-		if c.State.Seen(q) == "" {
+		if len(c.State.Changed(q, pages)) != 0 {
 			t.Errorf("query %q is not seen", q)
 		}
 	}

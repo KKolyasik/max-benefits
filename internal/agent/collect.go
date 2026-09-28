@@ -195,12 +195,13 @@ func (c *Collector) query(ctx context.Context, q Query, r *run, log *slog.Logger
 		log.Info("nothing found")
 		return nil
 	}
-	digest := digest(sources)
-	if !c.Force && c.State.Seen(q.Text) == digest {
+	changed := c.State.Changed(q.Text, sources)
+	if !c.Force && len(changed) == 0 {
 		log.Info("pages did not change since the last run")
 		r.update(func(rep *Report) { rep.Unchanged++ })
 		return nil
 	}
+	log.Info("pages to read", "new_or_changed", changed, "force", c.Force)
 
 	proposals, problems, err := c.extract(ctx, q, sources, r)
 	if err != nil {
@@ -236,7 +237,7 @@ func (c *Collector) query(ctx context.Context, q Query, r *run, log *slog.Logger
 		log.Info("draft written", "path", path)
 		r.update(func(rep *Report) { rep.Drafts = append(rep.Drafts, path) })
 	}
-	return c.State.Remember(q.Text, digest)
+	return c.State.Remember(q.Text, sources)
 }
 
 // read downloads the found pages in parallel, so one slow site doesn't hold
@@ -250,7 +251,7 @@ func (c *Collector) read(ctx context.Context, q Query, results []search.Result, 
 			page, err := c.Fetch.Fetch(ctx, res.URL, q.Text)
 			if err != nil {
 				log.Info("page not read, using search snippets", "url", res.URL, "err", err)
-				src.Text = strings.Join(res.Snippets, "\n")
+				src.Text, src.Snippets = strings.Join(res.Snippets, "\n"), true
 			} else {
 				src.Text, src.Published, src.PDF = page.Text, page.Published, page.PDF
 				if src.Title == "" {
@@ -413,17 +414,6 @@ func normURL(u string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
 }
 
-func digest(sources []Source) string {
-	h := sha256.New()
-	for _, s := range sources {
-		h.Write([]byte(s.URL))
-		h.Write([]byte{0})
-		h.Write([]byte(s.Text))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 func (c *Collector) now() time.Time {
 	if c.Now != nil {
 		return c.Now()
@@ -431,18 +421,25 @@ func (c *Collector) now() time.Time {
 	return time.Now()
 }
 
-// State remembers a digest of the pages each query found last time, so
-// unchanged pages are not sent to the model again. Queries running at once
+// State remembers what the pages of each query said last time, page by
+// page, so a query goes to the model only when there is something new. The
+// order of the search results doesn't count, nor a page that could not be
+// read this time: a site that is down is no news. Queries running at once
 // share it.
 type State struct {
-	mu      sync.Mutex
-	path    string
-	digests map[string]string
+	mu   sync.Mutex
+	path string
+	// pages maps a query to its pages: an address to a digest of the page's
+	// text, or to "" for a page never read, known by search snippets only.
+	pages map[string]map[string]string
+	// legacy holds a digest of all the pages of a query at once, as the
+	// state was kept before; a query moves to pages on its next run.
+	legacy map[string]string
 }
 
 // LoadState reads the state file; a missing file is an empty state.
 func LoadState(path string) (*State, error) {
-	s := &State{path: path, digests: map[string]string{}}
+	s := &State{path: path, pages: map[string]map[string]string{}, legacy: map[string]string{}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -450,25 +447,83 @@ func LoadState(path string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read agent state: %w", err)
 	}
-	if err := json.Unmarshal(data, &s.digests); err != nil {
+	var queries map[string]json.RawMessage
+	if err := json.Unmarshal(data, &queries); err != nil {
 		return nil, fmt.Errorf("agent state %s: %w", path, err)
+	}
+	for query, v := range queries {
+		var pages map[string]string
+		if err := json.Unmarshal(v, &pages); err == nil {
+			s.pages[query] = pages
+			continue
+		}
+		var digest string
+		if err := json.Unmarshal(v, &digest); err != nil {
+			return nil, fmt.Errorf("agent state %s, query %q: %w", path, query, err)
+		}
+		s.legacy[query] = digest
 	}
 	return s, nil
 }
 
-// Seen returns the digest remembered for the query.
-func (s *State) Seen(query string) string {
+// Changed returns the pages that have something new for the query: pages
+// it has not seen and pages whose text changed. None means the query can do
+// without the model.
+func (s *State) Changed(query string, sources []Source) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.digests[query]
+	var changed []string
+	pages, ok := s.pages[query]
+	if !ok {
+		if digest, ok := s.legacy[query]; ok && digest == legacyDigest(sources) {
+			return nil
+		}
+		for _, src := range sources {
+			changed = append(changed, src.URL)
+		}
+		return changed
+	}
+	for _, src := range sources {
+		seen, known := pages[src.URL]
+		switch {
+		case !known:
+			changed = append(changed, src.URL)
+		case src.Snippets:
+			// Not read this time: nothing new to tell.
+		case seen != pageDigest(src.Text):
+			changed = append(changed, src.URL)
+		}
+	}
+	return changed
 }
 
-// Remember stores the digest of the query's pages and saves the state file.
-func (s *State) Remember(query, digest string) error {
+// Remember stores the pages of the query and saves the state file. A page
+// not read this time keeps what was read before.
+func (s *State) Remember(query string, sources []Source) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.digests[query] = digest
-	data, err := json.MarshalIndent(maps.Clone(s.digests), "", "  ")
+	pages := maps.Clone(s.pages[query])
+	if pages == nil {
+		pages = map[string]string{}
+	}
+	for _, src := range sources {
+		if !src.Snippets {
+			pages[src.URL] = pageDigest(src.Text)
+		} else if _, known := pages[src.URL]; !known {
+			pages[src.URL] = ""
+		}
+	}
+	s.pages[query] = pages
+	delete(s.legacy, query)
+
+	queries := make(map[string]any, len(s.pages)+len(s.legacy))
+	for q, digest := range s.legacy {
+		queries[q] = digest
+	}
+	for q, pages := range s.pages {
+		queries[q] = pages
+	}
+	data, err := json.MarshalIndent(queries, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -479,4 +534,29 @@ func (s *State) Remember(query, digest string) error {
 		return fmt.Errorf("save agent state: %w", err)
 	}
 	return nil
+}
+
+// counted is a line with the date and time of a page and a counter after
+// them, like "15 сентября 2026, 08:00 26 745": news sites count views there,
+// so the line changes on every read. The date and the time still count.
+var counted = regexp.MustCompile(`(?m)^([ \t]*(?:\d{1,2}[ \t\x{00A0}]+\p{L}+[ \t\x{00A0}]+\d{4}|\d{1,2}\.\d{1,2}\.\d{2,4})` +
+	`[, \t\x{00A0}]+\d{1,2}:\d{2})[ \t\x{00A0}\x{202F}]+\d[\d \t\x{00A0}\x{202F}]*$`)
+
+// pageDigest is a digest of what a page says, less its counter of views.
+func pageDigest(text string) string {
+	sum := sha256.Sum256([]byte(counted.ReplaceAllString(text, "$1")))
+	return hex.EncodeToString(sum[:])
+}
+
+// legacyDigest is the digest of all the pages of a query at once, as the
+// state was kept before.
+func legacyDigest(sources []Source) string {
+	h := sha256.New()
+	for _, s := range sources {
+		h.Write([]byte(s.URL))
+		h.Write([]byte{0})
+		h.Write([]byte(s.Text))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
