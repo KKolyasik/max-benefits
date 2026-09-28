@@ -36,10 +36,12 @@ type Bot struct {
 	out    Messenger
 	log    *slog.Logger
 	now    func() time.Time
-	// mod and admins are set by WithModeration, agent by WithAgent.
-	mod    Moderation
-	admins map[int64]bool
-	agent  Agent
+	// mod and admins are set by WithModeration, adminForAll by
+	// WithAdminForAll, agent by WithAgent.
+	mod         Moderation
+	admins      map[int64]bool
+	adminForAll bool
+	agent       Agent
 }
 
 func New(s *survey.Survey, kb knowledge.Base, store session.Store, out Messenger, log *slog.Logger) *Bot {

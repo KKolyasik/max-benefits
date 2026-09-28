@@ -278,6 +278,36 @@ func TestStudentsHaveNoAdmin(t *testing.T) {
 	}
 }
 
+// While reviewers try the bot, everyone is an admin: the screens open and the
+// decisions work, but the reports of the agent still go only to the listed
+// admins.
+func TestAdminForAll(t *testing.T) {
+	admin, student, kb := newAdminSetup(t)
+	kb.addDraft(grant, "")
+	admin.bot.WithAdminForAll()
+
+	student.start()
+	if !student.hasButton("Черновики") {
+		t.Error("with the flag on, everyone sees the drafts button")
+	}
+	student.say("/admin")
+	student.press("Одобрить")
+	if n, _ := kb.PendingDrafts(context.Background()); n != 0 {
+		t.Error("with the flag on, anyone can approve a draft")
+	}
+
+	seen := len(student.chat.messages)
+	if err := admin.bot.NotifyRun(context.Background(), moderation.Run{Trigger: moderation.ByCommand, Status: moderation.RunBusy}); err != nil {
+		t.Fatal(err)
+	}
+	if len(student.chat.messages) != seen {
+		t.Error("only the listed admins hear about the agent")
+	}
+	if admin.chat.last().Text != textRunBusy {
+		t.Errorf("the listed admin must hear about the agent, got %q", admin.chat.last().Text)
+	}
+}
+
 func TestUpdateDraftShowsWhatChanges(t *testing.T) {
 	admin, _, kb := newAdminSetup(t)
 	current, _, _ := kb.Card(context.Background(), "for_all")
