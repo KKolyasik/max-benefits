@@ -2,6 +2,7 @@ package main
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -49,16 +50,33 @@ func TestKafkaConfig(t *testing.T) {
 }
 
 func TestAdminForAllConfig(t *testing.T) {
-	for value, want := range map[string]bool{"": false, "false": false, "true": true, "1": true} {
-		t.Setenv("MAX_BOT_TOKEN", "token")
-		t.Setenv("ADMIN_FOR_ALL", value)
-		cfg, err := loadConfig()
-		if err != nil || cfg.AdminForAll != want {
-			t.Errorf("ADMIN_FOR_ALL=%q: got %v, %v", value, cfg.AdminForAll, err)
-		}
+	cases := map[string]struct {
+		value string
+		want  bool
+		ok    bool
+	}{
+		"unset":   {"", false, true},
+		"false":   {"false", false, true},
+		"true":    {"true", true, true},
+		"one":     {"1", true, true},
+		"garbage": {"yes please", false, false},
 	}
-	t.Setenv("ADMIN_FOR_ALL", "yes please")
-	if _, err := loadConfig(); err == nil {
-		t.Error("a value that is not a boolean must be rejected")
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("MAX_BOT_TOKEN", "token")
+			// CI sets these for the integration tests; they are not what is
+			// under test here.
+			t.Setenv("KAFKA_BROKERS", "")
+			t.Setenv("SCHEMA_REGISTRY_URL", "")
+			t.Setenv("DATABASE_URL", "")
+			t.Setenv("ADMIN_FOR_ALL", tc.value)
+			cfg, err := loadConfig()
+			if (err == nil) != tc.ok || cfg.AdminForAll != tc.want {
+				t.Errorf("got %v, %v", cfg.AdminForAll, err)
+			}
+			if err != nil && !strings.Contains(err.Error(), "ADMIN_FOR_ALL") {
+				t.Errorf("the error must be about ADMIN_FOR_ALL: %v", err)
+			}
+		})
 	}
 }
